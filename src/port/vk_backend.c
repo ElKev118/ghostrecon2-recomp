@@ -685,6 +685,11 @@ typedef struct {
     float surf[4];          /* W, H, 1/zmax, 0 */
     float texscale[4][4];   /* 1/w, 1/h (texel coordinates) or 1,1; z: enabled */
     int32_t alpha[4];       /* enable, func, ref, 0 */
+    /* Largest normalised coordinate inside each stage's texture when the
+     * image behind it is larger (a surface): u,v for stages 0/1 in [0],
+     * 2/3 in [1]. The hardware clamps at the texture's own edge; sampling
+     * on into the rest of the surface read whatever else lives there. */
+    float clampmax[2][4];
 } PushConsts;
 
 /* The pixel stage, std140, one copy per draw (Nv2aPixelState). */
@@ -706,7 +711,7 @@ static const char *VS_SRC =
     "layout(location=5) in vec4 inT1;\n"
     "layout(location=6) in vec4 inT2;\n"
     "layout(location=7) in vec4 inT3;\n"
-    "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; } pc;\n"
+    "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 vD0;\n"
     "layout(location=1) out vec4 vD1;\n"
     "layout(location=2) out vec4 vFog;\n"
@@ -733,7 +738,7 @@ static const char *FS_SRC =
     "layout(std140, set=0, binding=1) uniform RC {\n"
     "  uvec4 cicw[2]; uvec4 aicw[2]; uvec4 cocw[2]; uvec4 aocw[2]; uvec4 f0[2]; uvec4 f1[2];\n"
     "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; } rc;\n"
-    "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; } pc;\n"
+    "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 outColor;\n"
     /* A port of the executor's own CPU combiner (nv2a_combiner.c) and
      * texture-stage fetch (rc_stage_fetch), so both renderers agree. */
@@ -760,6 +765,8 @@ static const char *FS_SRC =
     "}\n"
     "float rd_a(uint b) { vec4 r = R[b & 15u]; return map_in((b & 16u) != 0u ? r.a : r.b, b); }\n"
     "vec4 samp(int st, vec2 uv) {\n"
+    "  vec4 cm = pc.clampmax[st >> 1]; vec2 mx = (st & 1) == 0 ? cm.xy : cm.zw;\n"
+    "  if (mx.x > 0.0) uv = clamp(uv, vec2(0.0), mx);\n"
     "  if (st == 0) return texture(tex[0], uv);\n"
     "  if (st == 1) return texture(tex[1], uv);\n"
     "  if (st == 2) return texture(tex[2], uv);\n"
@@ -1218,6 +1225,14 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     pc.texscale[st][0] = (float)stages[st].t.width / iw;
                     pc.texscale[st][1] = (float)stages[st].t.height / ih;
                 }
+                if (s_view_w && (stages[st].t.width < s_view_w
+                                 || stages[st].t.height < s_view_h)) {
+                    /* Half a texel inside the texture's own edge. */
+                    pc.clampmax[st >> 1][(st & 1) * 2 + 0] =
+                        ((float)stages[st].t.width - 0.5f) / iw;
+                    pc.clampmax[st >> 1][(st & 1) * 2 + 1] =
+                        ((float)stages[st].t.height - 0.5f) / ih;
+                }
             }
         }
     }
@@ -1307,17 +1322,6 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4 : 0;
         }
         pc.alpha[3] = dbg;
-        /* WORKAROUND (not a fix): the grade pass's AR lookup reads the
-         * scene's alpha as u; some draws (characters, trunks, walls) leave
-         * an alpha the hardware would not, and those turned cyan. Until
-         * that draw is found, the lookup uses u = 0.5 (red does not depend
-         * on u in GR2's table). RECOMP_VK_GRADE_ALPHA=1 restores the real
-         * lookup for debugging. See docs/VULKAN_PLAN.md. */
-        {
-            static int real = -1;
-            if (real < 0) real = getenv("RECOMP_VK_GRADE_ALPHA") != NULL;
-            if (!dbg && !real) pc.alpha[3] = 4;
-        }
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1400,6 +1404,18 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
                     b->pixel->other_stage_input, b->pixel->dot_rgb_mapping,
                     b->pixel->stage[0].t.offset, b->pixel->stage[1].t.offset,
                     b->pixel->stage[2].t.offset);
+        }
+    }
+    {
+        /* Colour formats seen per surface, once each. */
+        static uint32_t seen[64]; static int nseen;
+        uint32_t key = (sf->color_va & 0x0FFFFFFFu) | (b->pixel->color_format << 28);
+        int k;
+        for (k = 0; k < nseen && seen[k] != key; k++) ;
+        if (k == nseen && nseen < 64) {
+            seen[nseen++] = key;
+            fprintf(stderr, "[VKB] surface %08X colour format %u\n", sf->color_va,
+                    b->pixel->color_format);
         }
     }
     draw_vertices(sf, b->state, b->vertices, b->count, b->pixel->stage, b->pixel->zmax,
