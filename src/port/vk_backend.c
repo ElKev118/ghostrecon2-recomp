@@ -439,7 +439,12 @@ static uint64_t hash_bytes(const uint8_t *p, uint32_t n)
     uint32_t i;
     /* Every 8th dword plus the length: a texture streamed or rewritten in
      * place changes far more than one word in 32. */
-    for (i = 0; i + 4 <= n; i += 32) {
+    /* Small textures are hashed whole: a colour ramp the title rewrites
+     * every frame (Ghost Recon 2's grade strip, 8 KB) can change in words
+     * a sparse sample never reads, and a stale strip turned the graded
+     * scene green. Large ones are sampled every 32 bytes. */
+    uint32_t step = n <= 65536u ? 4u : 32u;
+    for (i = 0; i + 4 <= n; i += step) {
         h ^= *(const uint32_t *)(p + i);
         h *= 1099511628211ull;
     }
