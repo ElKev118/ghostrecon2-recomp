@@ -1341,6 +1341,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     f->vused += (bytes + 255u) & ~255u;
 
     memset(&ubo, 0, sizeof ubo);
+    uint32_t px_state_sp = px ? px->stage_program : 0, px_state_ctl = px ? px->control : 0;
+    uint32_t px_state_f0 = px ? px->final0 : 0, px_state_f1 = px ? px->final1 : 0;
+    uint32_t px_state_seen = px ? px->rc_seen : 0;
     if (px) {
         memcpy(ubo.cicw, px->color_icw, 32);
         memcpy(ubo.aicw, px->alpha_icw, 32);
@@ -1427,6 +1430,58 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
     vkCmdDraw(cmd, count, 1, 0, 0);
     {
+        /* RECOMP_VK_PROBE=x,y (+ flag file probe.flag): for one frame, read
+         * pixel (x,y) of the colour target after every draw and log it with
+         * the draw's state -- which draw turns a pixel wrong. */
+        static int px = -2, py, active, done, idx;
+        if (px == -2) {
+            const char *e = getenv("RECOMP_VK_PROBE");
+            px = -1;
+            if (e) sscanf(e, "%d,%d", &px, &py);
+        }
+        if (px >= 0 && !done) {
+            if (!active && GetFileAttributesA("probe.flag") != INVALID_FILE_ATTRIBUTES)
+                active = 1;
+            if (active && B.rt_color && (uint32_t)px < B.rt_color->w && (uint32_t)py < B.rt_color->h) {
+                VkBuffer pb; VkDeviceMemory pm; uint8_t *mp; VkBufferImageCopy c;
+                Surface *t = B.rt_color;
+                if (make_buffer((VkDeviceSize)t->w * t->h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &pb, &pm, (void **)&mp)) {
+                    to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    memset(&c, 0, sizeof c);
+                    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    c.imageSubresource.layerCount = 1;
+                    c.imageExtent.width = t->w; c.imageExtent.height = t->h; c.imageExtent.depth = 1;
+                    vkCmdCopyImageToBuffer(cur()->cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pb, 1, &c);
+                    submit_frame();
+                    vkDeviceWaitIdle(B.dev);
+                    begin_frame();
+                    B.rt_color = NULL;
+                    {
+                        size_t k, np = (size_t)t->w * t->h; unsigned cyan = 0;
+                        for (k = 0; k < np; k++) {
+                            int bb = mp[k*4], gg = mp[k*4+1], rr = mp[k*4+2];
+                            if (gg > rr + 25 && bb > rr + 20) cyan++;
+                        }
+                        mp[0] = (uint8_t)(cyan >> 24); mp[1] = (uint8_t)(cyan >> 16);
+                        mp[2] = (uint8_t)(cyan >> 8);  mp[3] = (uint8_t)cyan;
+                        fprintf(stderr, "[PROBE] cyan %u ", cyan);
+                    }
+                    fprintf(stderr, "[PROBE] #%d surf %08X n %u -> BGRA %3u %3u %3u %3u | blend %u %X/%X eq %X cmask %08X | prog %05X ctl %08X fin %08X %08X | rc_seen %u | t0 %08X fmt %02X t1 %08X fmt %02X\n",
+                            idx++, t->va, count, mp[0], mp[1], mp[2], mp[3],
+                            rs->blend_enable, rs->blend_src, rs->blend_dst, rs->blend_eq, rs->color_mask,
+                            px_state_sp, px_state_ctl, px_state_f0, px_state_f1, px_state_seen,
+                            stages ? stages[0].t.offset : 0, stages ? stages[0].t.color : 0,
+                            stages ? stages[1].t.offset : 0, stages ? stages[1].t.color : 0);
+                    vkDestroyBuffer(B.dev, pb, NULL);
+                    vkFreeMemory(B.dev, pm, NULL);
+                }
+            }
+        }
+        if (active && !done && (sf->color_va & 0x0FFFFFFFu) != 0x00670000u
+            && (sf->color_va & 0x0FFFFFFFu) != 0x0079C000u && idx > 50)
+            done = 1;
+    }
+    {
         /* RECOMP_VK_WATCH_DUMP=<n>: read every surface back right after the
          * n-th draw into the watched surface (once). */
         static int at = -2;
@@ -1469,6 +1524,26 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
                     b->pixel->other_stage_input, b->pixel->dot_rgb_mapping,
                     b->pixel->stage[0].t.offset, b->pixel->stage[1].t.offset,
                     b->pixel->stage[2].t.offset);
+        }
+    }
+    {
+        /* Texture-stage modes the uber-shader does not implement, once per
+         * stage program. */
+        static uint32_t seenp[64]; static int ns;
+        uint32_t sp = b->pixel->stage_program, k, bad = 0;
+        for (k = 0; k < 4; k++) {
+            uint32_t m = (sp >> (k * 5)) & 31;
+            if (m && m != 1 && m != 2 && m != 4 && m != 5 && m != 15 && m != 16) bad = 1;
+        }
+        if (bad) {
+            int j;
+            for (j = 0; j < ns && seenp[j] != sp; j++) ;
+            if (j == ns && ns < 64) {
+                seenp[ns++] = sp;
+                fprintf(stderr, "[VKB] unsupported stage modes: prog %05X = %u %u %u %u, blend %u %X/%X, surf %08X\n",
+                        sp, sp & 31, (sp >> 5) & 31, (sp >> 10) & 31, (sp >> 15) & 31,
+                        b->state->blend_enable, b->state->blend_src, b->state->blend_dst, sf->color_va);
+            }
         }
     }
     {
