@@ -127,6 +127,7 @@ static struct {
 
     int failed;
     uint32_t write_seq;
+    uint32_t next_target, next_target_w;   /* colour target of the draw being set up */
 } B;
 
 static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
@@ -594,7 +595,12 @@ static VkImageView texture_view(const Nv2aTexStage *st)
     if (s && s->cpu_newer)
         s = NULL;                              /* read guest memory instead */
     if (s) {
-        if (s == B.rt_color) {
+        /* The target of the draw being prepared, not of the last one: a
+         * post-process pass that draws onto the scene while reading it,
+         * right after drawing elsewhere, sampled its own attachment -- a
+         * feedback loop with undefined results (the diagonal seam between
+         * the quad's triangles, half-screen tints, flickering veils). */
+        if (s->va == B.next_target && s->w == B.next_target_w) {
             /* Sampling the target being drawn: the title reads the previous
              * contents (a full-screen pass over its own scene). Vulkan
              * cannot sample an attachment it writes, so sample a copy. */
@@ -1251,6 +1257,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     memset(&pc, 0, sizeof pc);
     memset(cmin, 0, sizeof cmin);
     /* Textures first: sampling a surface may end the current rendering. */
+    B.next_target = va_key(sf->color_va);
+    B.next_target_w = sf->pitch / (sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
+    if (B.next_target_w < sf->width) B.next_target_w = sf->width;
     for (st = 0; st < 4; st++) {
         VkImageView view;
         s_view_w = s_view_h = 0;
