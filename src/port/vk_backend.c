@@ -54,6 +54,7 @@ typedef struct {
      * as a texture it then comes from memory; drawing into it again clears
      * the flag. */
     int cpu_newer;
+    uint32_t written;       /* B.write_seq when last drawn/cleared/blitted into */
 } Surface;
 
 typedef struct {
@@ -125,6 +126,7 @@ static struct {
     int out_i;
 
     int failed;
+    uint32_t write_seq;
 } B;
 
 static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
@@ -281,18 +283,45 @@ static void submit_frame(void)
 
 /* ---- surfaces --------------------------------------------------------- */
 
+/* Surfaces are keyed by address AND width (from the pitch): Ghost Recon 2
+ * uses one address as a 256-wide colour table, a 640-wide buffer and a
+ * blit target within one frame. One image per address made them overwrite
+ * each other (red flash, washed-out glow, wrong HUD) or read past the
+ * table into the buffer.
+ *
+ * find_surface: want_w = 0 means "any width": the one written last. */
+static Surface *find_surface_w(uint32_t va, int depth, uint32_t want_w)
+{
+    Surface *best = NULL;
+    int i;
+    for (i = 0; i < VKB_MAX_SURFACES; i++) {
+        Surface *c = &B.surf[i];
+        if (!c->img || c->depth != depth || c->va != va_key(va))
+            continue;
+        if (want_w && c->w != want_w)
+            continue;
+        if (!best || c->written > best->written)
+            best = c;
+    }
+    return best;
+}
+
 static Surface *find_surface(uint32_t va, int depth)
 {
-    int i;
-    for (i = 0; i < VKB_MAX_SURFACES; i++)
-        if (B.surf[i].img && B.surf[i].depth == depth && B.surf[i].va == va_key(va))
-            return &B.surf[i];
-    return NULL;
+    return find_surface_w(va, depth, 0);
+}
+
+/* The surface a texture of this size reads: same width if there is one,
+ * else the most recently written. */
+static Surface *find_surface_for_tex(uint32_t va, uint32_t tw)
+{
+    Surface *s = find_surface_w(va, 0, tw);
+    return s ? s : find_surface(va, 0);
 }
 
 static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
 {
-    Surface *s = find_surface(va, depth);
+    Surface *s = find_surface_w(va, depth, depth ? 0 : w);
     int i, slot = -1;
 
     if (s && s->w >= w && s->h >= h) {
@@ -388,6 +417,7 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
     if (!c)
         return 0;
     c->cpu_newer = 0;
+    c->written = ++B.write_seq;
     if (B.rendering && B.rt_color == c && B.rt_depth == d)
         return 1;
     end_rendering();
@@ -547,7 +577,20 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         || src->width > 4096 || src->height > 4096)
         return NULL;
     /* Rendered by us: sample the surface itself. */
-    s = find_surface(src->offset, 0);
+    s = find_surface_for_tex(src->offset, src->width);
+    if (s && src->width == 256 && (src->offset & 0x0FFFFFFFu) == 0x00A17000u) {
+        Surface *big = find_surface_w(src->offset, 0, 640);
+        static unsigned n;
+        if (big && big->written > s->written && n++ < 30)
+            fprintf(stderr, "[VKB] grade lookup: table written %u but 640 buffer at the same address written later (%u)\n",
+                    s->written, big->written);
+    }
+    if (0) {
+        static unsigned said;
+        if (said++ < 20)
+            fprintf(stderr, "[VKB] tex %08X %ux%u: no surface that wide, using %ux%u (written %u, seq %u)\n",
+                    src->offset, src->width, src->height, s->w, s->h, s->written, B.write_seq);
+    }
     if (s && s->cpu_newer)
         s = NULL;                              /* read guest memory instead */
     if (s) {
@@ -1538,6 +1581,8 @@ static int vkb_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
     d = get_surface(dst_va, 0, dst_pitch / 4 > dx + w ? dst_pitch / 4 : dx + w, dy + h);
     if (!d || d == s)
         return 0;
+    d->written = ++B.write_seq;
+    d->cpu_newer = 0;
     to_layout(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     to_layout(d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&rgn, 0, sizeof rgn);
@@ -1736,7 +1781,9 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
     (void)pitch; (void)aa_sx; (void)aa_sy;
     if (B.failed || !init())
         return;
-    s = find_surface(va, 0);
+    s = find_surface_w(va, 0, w);
+    if (!s)
+        s = find_surface(va, 0);
     begin_frame();
     if (s && w && h) {
         o = B.out_i ^ 1;
