@@ -1,0 +1,194 @@
+[
+ {
+  "start": "0x0042C1FF",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042CBBF",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042CBE2",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042CBEF",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042CC00",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FDFA",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FE05",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FE10",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FE1B",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FE26",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0042FE31",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434802",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0043480A",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434812",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0043481A",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434822",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0043482A",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434832",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0043483A",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434A6F",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434A7C",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00434A89",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435B4B",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435B75",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435B93",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435BAC",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435BC6",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435BEE",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435C05",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x00435C44",
+  "note": "pointer in data to undetected D3D code after ret/pad"
+ },
+ {
+  "start": "0x0044D92B",
+  "note": "pointer in data to undetected D3DX code after ret/pad"
+ },
+ {
+  "start": "0x0046286F",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x00467A48",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x004686BF",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x00474E49",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x0047BC99",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x0047F680",
+  "note": "pointer in data to undetected XGRPH code after ret/pad"
+ },
+ {
+  "start": "0x0049BE49",
+  "note": "pointer in data to undetected XONLINE code after ret/pad"
+ },
+ {
+  "start": "0x0049C188",
+  "note": "pointer in data to undetected XONLINE code after ret/pad"
+ },
+ {
+  "start": "0x0049FC28",
+  "note": "pointer in data to undetected XONLINE code after ret/pad"
+ },
+ {
+  "start": "0x004AD037",
+  "note": "pointer in data to undetected XONLINE code after ret/pad"
+ },
+ {
+  "start": "0x004BF5C3",
+  "note": "pointer in data to undetected XNET code after ret/pad"
+ },
+ {
+  "start": "0x004C8180",
+  "note": "pointer in data to undetected XMV code after ret/pad"
+ },
+ {
+  "start": "0x004F2C58",
+  "note": "pointer in data to undetected DSOUND code after ret/pad"
+ },
+ {
+  "start": "0x0050749E",
+  "note": "pointer in data to undetected XPP code after ret/pad"
+ },
+ {
+  "start": "0x00507AD9",
+  "note": "pointer in data to undetected XPP code after ret/pad"
+ },
+ {
+  "start": "0x00507ECD",
+  "note": "pointer in data to undetected XPP code after ret/pad"
+ },
+ {
+  "start": "0x0050BFD5",
+  "note": "pointer in data to undetected XPP code after ret/pad"
+ }
+]

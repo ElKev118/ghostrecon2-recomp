@@ -1,0 +1,108 @@
+[
+  {
+    "start": "0x0007ACD0",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x002D6A20",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x005061A0",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x00506BA7",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x005084EC",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x00507A87",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x0042C1FF",
+    "note": "pointer in data to undetected D3D code after ret/pad"
+  },
+  {
+    "start": "0x00435C44",
+    "note": "pointer in data to undetected D3D code after ret/pad"
+  },
+  {
+    "start": "0x0044D92B",
+    "note": "pointer in data to undetected D3DX code after ret/pad"
+  },
+  {
+    "start": "0x004686BF",
+    "note": "pointer in data to undetected XGRPH code after ret/pad"
+  },
+  {
+    "start": "0x0047BC99",
+    "note": "pointer in data to undetected XGRPH code after ret/pad"
+  },
+  {
+    "start": "0x0047F680",
+    "note": "pointer in data to undetected XGRPH code after ret/pad"
+  },
+  {
+    "start": "0x0049FC28",
+    "note": "pointer in data to undetected XONLINE code after ret/pad"
+  },
+  {
+    "start": "0x004AD037",
+    "note": "pointer in data to undetected XONLINE code after ret/pad"
+  },
+  {
+    "start": "0x004C8180",
+    "note": "pointer in data to undetected XMV code after ret/pad"
+  },
+  {
+    "start": "0x004F2C58",
+    "note": "pointer in data to undetected DSOUND code after ret/pad"
+  },
+  {
+    "start": "0x0050749E",
+    "note": "pointer in data to undetected XPP code after ret/pad"
+  },
+  {
+    "start": "0x00507AD9",
+    "note": "pointer in data to undetected XPP code after ret/pad"
+  },
+  {
+    "start": "0x00507ECD",
+    "note": "pointer in data to undetected XPP code after ret/pad"
+  },
+  {
+    "start": "0x0050BFD5",
+    "note": "pointer in data to undetected XPP code after ret/pad"
+  },
+  {
+    "start": "0x00050660",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x0013542C",
+    "observed": true,
+    "note": "CRT x87 _trandisp arm (table 0x57D638, jmp [ebx] at 0x135419); starts after ret"
+  },
+  {
+    "start": "0x002DFC80",
+    "observed": true,
+    "note": "Indirect-call target observed at runtime; decodes as a function body."
+  },
+  {
+    "start": "0x001354CE",
+    "observed": true,
+    "note": "CRT x87 _trandisp arm (table 0x57D638, jmp [ebx] at 0x135419); starts after ret"
+  }
+]
