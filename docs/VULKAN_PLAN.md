@@ -66,3 +66,7 @@ Comparación CPU↔Vulkan: `RECOMP_RENDERER=cpu|vk`, mismo frame trazable con `R
 - Herramientas Vulkan: `RECOMP_VK_FS=magenta|d0|t0` (salida del shader), `RECOMP_VK_NOCULL=1`, `RECOMP_VK_DUMP_SURFACES=1` (todas las superficies + canal alfa), `RECOMP_VK_WATCH=<va>` (+`_DUMP=n`, `_TEX=<va>`: volcado justo tras el n-ésimo draw), `RECOMP_VK_DUMP_TEX=<va>` (textura tal cual se sube y leída de la GPU).
 - Audio: `RECOMP_AUDIO_VOLUME=0..100` (toolkit `apu_core.c`); lanzadores al 30 %, pruebas automáticas a 0.
 - Estado: menús/HUD correctos; cinemática in-engine con color correcto; **en partida tinte verde**. El LUT (256x256) ya se genera bien; el verde viene de la consulta dependiente `.ar`: el alfa de la escena es demasiado alto. Siguiente: comparar el alfa de la escena CPU vs GPU en partida.
+
+### 2026-10-19 (noche) — color en partida
+- Tinte rojo/verde/cian en partida resuelto en 3 pasos: (1) texturas pequeñas con hash completo (la tira del LUT se reescribe cada frame); (2) coordenadas escaladas cuando la superficie muestreada es mayor que la textura (el LUT 256x256 vive en una dirección que también es buffer 640x480); (3) **WORKAROUND**: la consulta DEPENDENT_AR del pase de corrección usa u=0.5 en vez del alfa de la escena (`RECOMP_VK_GRADE_ALPHA=1` restaura). Causa real pendiente: algunos draws (personajes, troncos, paredes) dejan en la escena un alfa que el hardware no dejaría → buscar ese draw (comparar alfa CPU vs GPU o con xemu).
+- Pendiente: destello rojo al inicio de misión (primeros frames sin LUT).

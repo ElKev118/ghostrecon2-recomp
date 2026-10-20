@@ -802,7 +802,8 @@ static const char *FS_SRC =
     "      } else if (mode == 15u || mode == 16u) {\n"
     "        int src = st <= 1 ? 0 : int((rc.ctl.z >> (st == 2 ? 16u : 20u)) & 15u) % st;\n"
     "        vec4 i = t[src];\n"
-    "        t[st] = samp(st, (mode == 15u ? vec2(i.a, i.r) : vec2(i.g, i.b)) * pc.texscale[st].xy);\n"
+    "        vec2 dc = mode == 15u ? vec2(pc.alpha.w == 4 ? 0.5 : i.a, i.r) : vec2(i.g, i.b);\n"
+    "        t[st] = samp(st, dc * pc.texscale[st].xy);\n"
     "      } else t[st] = vec4(0.0);\n"
     "    }\n"
     "    for (int k = 0; k < 16; k++) R[k] = vec4(0.0);\n"
@@ -1295,9 +1296,20 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (dbg < 0) {
             const char *e = getenv("RECOMP_VK_FS");
             dbg = !e ? 0 : !strcmp(e, "magenta") ? 1 : !strcmp(e, "d0") ? 2
-                : !strcmp(e, "t0") ? 3 : 0;
+                : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4 : 0;
         }
         pc.alpha[3] = dbg;
+        /* WORKAROUND (not a fix): the grade pass's AR lookup reads the
+         * scene's alpha as u; some draws (characters, trunks, walls) leave
+         * an alpha the hardware would not, and those turned cyan. Until
+         * that draw is found, the lookup uses u = 0.5 (red does not depend
+         * on u in GR2's table). RECOMP_VK_GRADE_ALPHA=1 restores the real
+         * lookup for debugging. See docs/VULKAN_PLAN.md. */
+        {
+            static int real = -1;
+            if (real < 0) real = getenv("RECOMP_VK_GRADE_ALPHA") != NULL;
+            if (!dbg && !real) pc.alpha[3] = 4;
+        }
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
