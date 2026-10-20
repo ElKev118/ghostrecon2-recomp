@@ -699,6 +699,7 @@ typedef struct {
     uint32_t ctl[4];        /* control, stage_program, other_stage_input, rc_seen */
     uint32_t misc[4];       /* clip_plane_mode, fog_enable, fog_color, fog_mode */
     float    fogp[4];       /* fog bias, fog scale */
+    float    clampmin[2][4];/* half a texel of the image, per stage (see clampmax) */
 } RcUbo;
 
 static const char *VS_SRC =
@@ -737,7 +738,7 @@ static const char *FS_SRC =
     "layout(set=0, binding=0) uniform sampler2D tex[4];\n"
     "layout(std140, set=0, binding=1) uniform RC {\n"
     "  uvec4 cicw[2]; uvec4 aicw[2]; uvec4 cocw[2]; uvec4 aocw[2]; uvec4 f0[2]; uvec4 f1[2];\n"
-    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; } rc;\n"
+    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; } rc;\n"
     "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 outColor;\n"
     /* A port of the executor's own CPU combiner (nv2a_combiner.c) and
@@ -766,7 +767,8 @@ static const char *FS_SRC =
     "float rd_a(uint b) { vec4 r = R[b & 15u]; return map_in((b & 16u) != 0u ? r.a : r.b, b); }\n"
     "vec4 samp(int st, vec2 uv) {\n"
     "  vec4 cm = pc.clampmax[st >> 1]; vec2 mx = (st & 1) == 0 ? cm.xy : cm.zw;\n"
-    "  if (mx.x > 0.0) uv = clamp(uv, vec2(0.0), mx);\n"
+    "  vec4 cn = rc.clampmin[st >> 1]; vec2 mn = (st & 1) == 0 ? cn.xy : cn.zw;\n"
+    "  if (mx.x > 0.0) uv = clamp(uv, mn, mx);\n"
     "  if (st == 0) return texture(tex[0], uv);\n"
     "  if (st == 1) return texture(tex[1], uv);\n"
     "  if (st == 2) return texture(tex[2], uv);\n"
@@ -1178,6 +1180,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                           const Nv2aPixelState *px)
 {
     RcUbo ubo;
+    float cmin[4][2];
     VkDescriptorBufferInfo ubi;
     VkWriteDescriptorSet w2[2];
     Frame *f;
@@ -1198,11 +1201,12 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     if (bytes > VKB_VBUF_BYTES)
         return;
     if (cur()->vused + bytes > VKB_VBUF_BYTES
-        || cur()->uused + 256u > VKB_UBUF_BYTES) {
+        || cur()->uused + 512u > VKB_UBUF_BYTES) {
         submit_frame();
         begin_frame();
     }
     memset(&pc, 0, sizeof pc);
+    memset(cmin, 0, sizeof cmin);
     /* Textures first: sampling a surface may end the current rendering. */
     for (st = 0; st < 4; st++) {
         VkImageView view;
@@ -1227,6 +1231,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 }
                 if (s_view_w && (stages[st].t.width < s_view_w
                                  || stages[st].t.height < s_view_h)) {
+                    cmin[st][0] = 0.5f / iw;
+                    cmin[st][1] = 0.5f / ih;
                     /* Half a texel inside the texture's own edge. */
                     pc.clampmax[st >> 1][(st & 1) * 2 + 0] =
                         ((float)stages[st].t.width - 0.5f) / iw;
@@ -1298,11 +1304,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         ubo.misc[2] = px->fog_color; ubo.misc[3] = px->fog_mode;
         ubo.fogp[0] = px->fog_param[0]; ubo.fogp[1] = px->fog_param[1];
     }
+    {
+        int k;
+        for (k = 0; k < 4; k++) {
+            ubo.clampmin[k >> 1][(k & 1) * 2 + 0] = cmin[k][0];
+            ubo.clampmin[k >> 1][(k & 1) * 2 + 1] = cmin[k][1];
+        }
+    }
     memcpy(f->umap + f->uused, &ubo, sizeof ubo);
     ubi.buffer = f->ubuf;
     ubi.offset = f->uused;
     ubi.range = sizeof ubo;
-    f->uused += 256u;
+    f->uused += 512u;    /* sizeof(RcUbo) <= 512, offset alignment */
 
     pc.surf[0] = (float)sf->pitch / (float)(sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
     if (pc.surf[0] < (float)sf->width) pc.surf[0] = (float)sf->width;
