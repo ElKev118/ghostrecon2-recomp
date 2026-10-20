@@ -79,3 +79,11 @@ Comparación CPU↔Vulkan: `RECOMP_RENDERER=cpu|vk`, mismo frame trazable con `R
 - Descartado (medido): el LUT nunca está desfasado respecto al buffer 640 (`grade lookup: table ... written later` = 0 casos).
 - Textura 300x300 en `0x00A17000` se lee desde la superficie 320x300 (ancho de pitch 320): pendiente revisar si es la sombra/máscara de HUD.
 - Siguiente hipótesis: el veil/cuadrante viene de la cadena de glow 320x200 (`0x00A57000`/`0x00A95800`, texturas lineales fmt 0x12 con coordenadas en texeles) — comprobar escala de coordenadas texel cuando la imagen es mayor que el clip, y el blend aditivo del pase final. Herramientas: `RECOMP_VK_WATCH=A57000 RECOMP_VK_WATCH_DUMP=n`, `RECOMP_VK_DUMP_SURFACES=1`.
+
+### Pendiente para la próxima sesión (2026-10-20)
+Observado por el usuario en `run_gr2_vulkan.bat` (commit 77b5b81):
+- **Diagonal fina de colores glitch** de la esquina sup-izq a la inf-der: costura entre los 2 triángulos del quad a pantalla completa del post-proceso → los dos triángulos muestrean distinto.
+- **Mitad izquierda correcta / mitad derecha cian**, corte vertical en el centro (y veil rojo/blanco que aparece también jugando, no solo en la cinemática).
+- Hipótesis única: el pase final lee una superficie que también es el destino actual → se usa la copia (`texture_view`, rama `s == B.rt_color`, `static Surface copy`). Revisar: (1) que la copia se rehaga en cada uso y no quede desfasada; (2) escala/clamp de coordenadas por triángulo (texscale, clampmin/max); (3) que `B.rt_color = NULL` tras la copia no deje un rendering a medias (dynamic rendering reiniciado a mitad del quad).
+- Prueba: `RECOMP_VK_WATCH=670000 RECOMP_VK_WATCH_DUMP=n RECOMP_VK_DUMP_SURFACES=1` en el frame con el fallo; comparar con `RECOMP_VK_FS=t0`.
+- Sigue pendiente: destello rojo inicial, parches cian, icono de salud (izquierda) en magenta/verde; después cinemáticas que se pausan y 6–8 FPS (vertex programs a GPU).
