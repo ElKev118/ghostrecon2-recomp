@@ -1462,8 +1462,11 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                             int bb = mp[k*4], gg = mp[k*4+1], rr = mp[k*4+2];
                             if (gg > rr + 25 && bb > rr + 20) cyan++;
                         }
-                        mp[0] = (uint8_t)(cyan >> 24); mp[1] = (uint8_t)(cyan >> 16);
-                        mp[2] = (uint8_t)(cyan >> 8);  mp[3] = (uint8_t)cyan;
+                        {
+                            unsigned long long sum = 0;
+                            for (k = 0; k < np; k++) sum += mp[k*4] + mp[k*4+1] + mp[k*4+2];
+                            fprintf(stderr, "[PROBE] sum %llu ", sum);
+                        }
                         fprintf(stderr, "[PROBE] cyan %u ", cyan);
                     }
                     fprintf(stderr, "[PROBE] #%d surf %08X n %u -> BGRA %3u %3u %3u %3u | blend %u %X/%X eq %X cmask %08X | prog %05X ctl %08X fin %08X %08X | rc_seen %u | t0 %08X fmt %02X t1 %08X fmt %02X\n",
@@ -1477,8 +1480,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 }
             }
         }
-        if (active && !done && (sf->color_va & 0x0FFFFFFFu) != 0x00670000u
-            && (sf->color_va & 0x0FFFFFFFu) != 0x0079C000u && idx > 50)
+        /* A whole frame: the post-process passes after the scene (onto the
+         * scene surface itself) are where the colour is decided. */
+        if (active && !done && idx > 2500)
             done = 1;
     }
     {
