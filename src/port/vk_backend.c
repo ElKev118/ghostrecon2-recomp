@@ -49,6 +49,11 @@ typedef struct {
     VkImageView view;
     VkImageLayout layout;
     uint32_t last_used;
+    /* Guest memory holds newer contents than the image: something wrote the
+     * surface without us (a 2D blit from a source we never rendered). Sampled
+     * as a texture it then comes from memory; drawing into it again clears
+     * the flag. */
+    int cpu_newer;
 } Surface;
 
 typedef struct {
@@ -382,6 +387,7 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
         d = get_surface(zeta_va, 1, w, h);
     if (!c)
         return 0;
+    c->cpu_newer = 0;
     if (B.rendering && B.rt_color == c && B.rt_depth == d)
         return 1;
     end_rendering();
@@ -542,6 +548,8 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         return NULL;
     /* Rendered by us: sample the surface itself. */
     s = find_surface(src->offset, 0);
+    if (s && s->cpu_newer)
+        s = NULL;                              /* read guest memory instead */
     if (s) {
         if (s == B.rt_color) {
             /* Sampling the target being drawn: the title reads the previous
@@ -1489,8 +1497,14 @@ static int vkb_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
     if (B.failed || !init() || bpp != 4)
         return 0;
     s = find_surface(src_va, 0);
-    if (!s)
-        return 0;                              /* not ours: let the CPU copy */
+    if (!s) {
+        /* Not ours: the executor copies guest memory, so our image of the
+         * destination (if any) is now older than memory. */
+        d = find_surface(dst_va, 0);
+        if (d)
+            d->cpu_newer = 1;
+        return 0;
+    }
     begin_frame();
     d = get_surface(dst_va, 0, dst_pitch / 4 > dx + w ? dst_pitch / 4 : dx + w, dy + h);
     if (!d || d == s)
