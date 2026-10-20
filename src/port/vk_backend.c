@@ -522,6 +522,12 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
 }
 
 /* The view a stage samples, or NULL for "use white". */
+/* Size of the image behind the last view texture_view returned: a surface
+ * can be larger than the texture the title samples from it (Ghost Recon 2
+ * draws its 256x256 grade table into an address it also uses as a 640x480
+ * buffer), so coordinates must be scaled to the part that holds the data. */
+static uint32_t s_view_w, s_view_h;
+
 static VkImageView texture_view(const Nv2aTexStage *st)
 {
     const Nv2aTexture *src = &st->t;
@@ -573,9 +579,11 @@ static VkImageView texture_view(const Nv2aTexStage *st)
                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             copy.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             B.rt_color = NULL;                 /* rendering must restart */
+            s_view_w = copy.w; s_view_h = copy.h;
             return copy.view;
         }
         to_layout(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        s_view_w = s->w; s_view_h = s->h;
         return s->view;
     }
 
@@ -794,7 +802,7 @@ static const char *FS_SRC =
     "      } else if (mode == 15u || mode == 16u) {\n"
     "        int src = st <= 1 ? 0 : int((rc.ctl.z >> (st == 2 ? 16u : 20u)) & 15u) % st;\n"
     "        vec4 i = t[src];\n"
-    "        t[st] = samp(st, mode == 15u ? vec2(i.a, i.r) : vec2(i.g, i.b));\n"
+    "        t[st] = samp(st, (mode == 15u ? vec2(i.a, i.r) : vec2(i.g, i.b)) * pc.texscale[st].xy);\n"
     "      } else t[st] = vec4(0.0);\n"
     "    }\n"
     "    for (int k = 0; k < 16; k++) R[k] = vec4(0.0);\n"
@@ -1181,17 +1189,26 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     memset(&pc, 0, sizeof pc);
     /* Textures first: sampling a surface may end the current rendering. */
     for (st = 0; st < 4; st++) {
-        VkImageView view = stages ? texture_view(&stages[st]) : NULL;
+        VkImageView view;
+        s_view_w = s_view_h = 0;
+        view = stages ? texture_view(&stages[st]) : NULL;
         ii[st].sampler = stages ? get_sampler(&stages[st]) : B.samplers[0];
         ii[st].imageView = view ? view : B.white_view;
         ii[st].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         if (view) {
             pc.texscale[st][2] = 1.0f;
-            if (!stages[st].normalised) {
-                pc.texscale[st][0] = 1.0f / (float)stages[st].t.width;
-                pc.texscale[st][1] = 1.0f / (float)stages[st].t.height;
-            } else {
-                pc.texscale[st][0] = pc.texscale[st][1] = 1.0f;
+            {
+                /* Image size: the texture's own, or the surface's when the
+                 * texture is a rendered surface (possibly larger). */
+                float iw = s_view_w ? (float)s_view_w : (float)stages[st].t.width;
+                float ih = s_view_h ? (float)s_view_h : (float)stages[st].t.height;
+                if (!stages[st].normalised) {          /* texel coordinates */
+                    pc.texscale[st][0] = 1.0f / iw;
+                    pc.texscale[st][1] = 1.0f / ih;
+                } else {                               /* [0,1] of the texture */
+                    pc.texscale[st][0] = (float)stages[st].t.width / iw;
+                    pc.texscale[st][1] = (float)stages[st].t.height / ih;
+                }
             }
         }
     }
@@ -1352,6 +1369,19 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
 {
     if (B.failed)
         return;
+    {
+        /* Once: the inputs of the colour-grade pass (dependent stages). */
+        static int said;
+        uint32_t sp = b->pixel->stage_program;
+        if (said < 3 && (((sp >> 5) & 31) == 15 || ((sp >> 10) & 31) == 16)) {
+            said++;
+            fprintf(stderr, "[VKB] dependent pass: prog %05X other_stage_input %08X"
+                    " dot_map %08X stages %08X %08X %08X\n", sp,
+                    b->pixel->other_stage_input, b->pixel->dot_rgb_mapping,
+                    b->pixel->stage[0].t.offset, b->pixel->stage[1].t.offset,
+                    b->pixel->stage[2].t.offset);
+        }
+    }
     draw_vertices(sf, b->state, b->vertices, b->count, b->pixel->stage, b->pixel->zmax,
                   b->pixel);
 }
