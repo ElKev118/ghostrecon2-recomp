@@ -59,6 +59,14 @@ Capturas de referencia del avance: el usuario las tiene; las mejores son "cielo 
 
 **Regla**: un cambio de `target_compile_definitions`/`include_directories` a nivel de *target* en `CMakeLists.txt` obliga a recompilar los 112 chunks (~15 min). Por eso los includes del port van por `set_source_files_properties` en ficheros concretos.
 
+### 3.1b Entorno de terminal (léelo si un comando falla con "No such file")
+- La terminal debe ser **Git Bash** (`/usr/bin/bash` de Git for Windows). No WSL (allí `/c/...` no existe, es `/mnt/c/...`), no PowerShell/cmd (no entienden `&&`, `/c/...`, `grep`).
+- El workspace del editor puede ser `C:\XboxRecompProject\xboxrecomp` (el toolkit); el proyecto del juego está al lado, en `C:\XboxRecompProject\ghostrecon2`. Usa **siempre rutas absolutas** y lanza los scripts con `bash`: `bash /c/XboxRecompProject/ghostrecon2/tools/run_test.sh 150 vk`.
+- Comprobación rápida del entorno: `ls /c/XboxRecompProject/ghostrecon2/build/Release/ghostrecon2.exe` debe existir (el exe YA está compilado; no lo borres ni reconfigures CMake).
+- El exe no acepta argumentos (`--version` no existe): todo se configura con variables de entorno.
+- **No reescribas `tools/run_test.sh`, `tools/regen.sh`, los `.bat` ni `CMakeLists.txt`.** Si necesitas otras variables, expórtalas antes de llamar al script (las respeta). Si crees que hay que cambiarlos, proponlo al usuario.
+- No muevas ni borres `build/Release/game/memory.log`, `run*.log` ni ficheros de `game/`.
+
 ### 3.2 Comandos (Git Bash)
 
 ```bash
