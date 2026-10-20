@@ -59,6 +59,23 @@ Capturas de referencia del avance: el usuario las tiene; las mejores son "cielo 
 
 **Regla**: un cambio de `target_compile_definitions`/`include_directories` a nivel de *target* en `CMakeLists.txt` obliga a recompilar los 112 chunks (~15 min). Por eso los includes del port van por `set_source_files_properties` en ficheros concretos.
 
+### 3.1a Agentes en Cline/terminales que ejecutan cada comando por separado
+Cline parte las líneas por `&&` y no conserva `cd` entre comandos. **Usa solo el punto de entrada único**, un comando por línea, sin `&&` ni `cd`:
+
+```
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh build          # compilar (solo errores)
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh test 150 vk    # compilar + prueba muda
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh run 150 vk     # prueba sin compilar
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh grep "fps"     # líneas del log de prueba
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh log "\[CRASH\]" # contar un patrón
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh game           # log del motor del juego
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh status         # git de ambos repos
+bash /c/XboxRecompProject/ghostrecon2/tools/gr2.sh kill
+```
+Variables extra delante: `RECOMP_VK_DUMP_SURFACES=1 bash .../gr2.sh run 150 vk`. En Git Bash, `taskkill /F` se convierte en ruta (`F:/`): usa `gr2.sh kill`. Los `.bat` son para que juegue el usuario, no para pruebas.
+
+**Antes de proponer un cambio, verifica que el código existe** (`grep -n` en el fichero). El blending se hace en la *pipeline* de Vulkan (`get_pipeline` en `vk_backend.c`: `VkPipelineColorBlendAttachmentState`), el sombreado en el GLSL embebido (`FS_SRC`); no hay funciones de blend en C con `vec4`.
+
 ### 3.1b Entorno de terminal (léelo si un comando falla con "No such file")
 - La terminal debe ser **Git Bash** (`/usr/bin/bash` de Git for Windows). No WSL (allí `/c/...` no existe, es `/mnt/c/...`), no PowerShell/cmd (no entienden `&&`, `/c/...`, `grep`).
 - El workspace del editor puede ser `C:\XboxRecompProject\xboxrecomp` (el toolkit); el proyecto del juego está al lado, en `C:\XboxRecompProject\ghostrecon2`. Usa **siempre rutas absolutas** y lanza los scripts con `bash`: `bash /c/XboxRecompProject/ghostrecon2/tools/run_test.sh 150 vk`.
