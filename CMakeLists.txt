@@ -166,6 +166,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     src/port/vk_window.c
     src/port/vk_backend.c
     src/port/vk_glsl.c
+    src/port/vk_psh_gen.c
     ${volk_SOURCE_DIR}/volk.c
     # SDL keycodes -> the shared key table (built only on POSIX by xbox_input)
     ${XBOXRECOMP_DIR}/src/input/keyboard_sdl.c

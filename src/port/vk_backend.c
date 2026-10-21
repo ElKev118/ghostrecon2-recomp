@@ -39,7 +39,7 @@
 #define VKB_UBUF_BYTES    (8u << 20)           /* combiner-state ring per frame */
 #define VKB_MAX_SURFACES  48
 #define VKB_MAX_TEXTURES  1024
-#define VKB_MAX_PIPELINES 1024
+#define VKB_MAX_PIPELINES 8192
 
 typedef struct {
     uint32_t va;                /* guest address (low 28 bits compared) */
@@ -69,10 +69,26 @@ typedef struct {
     uint32_t last_used;
 } Tex;
 
+/* Fragment-shader specialization: the combiner set-up of a draw (FS_SRC's
+ * S0..S43). One pipeline per distinct set-up and raster state. */
+#define SPEC_N 47
 typedef struct {
     uint64_t key[4];            /* key[3]: GPU vertex program (0: transformed) */
+    uint32_t spec[SPEC_N];
+    uint32_t hash;              /* of key and spec, for the lookup */
     VkPipeline pipe;
 } Pipe;
+static const uint32_t *s_spec;  /* the draw being set up (NULL: all zero) */
+
+/* Generated fragment shaders (vk_psh_gen.c), by set-up. */
+size_t vk_psh_gen(const uint32_t *spec, int zofs, char *buf, size_t cap);
+typedef struct {
+    uint32_t spec[SPEC_N];
+    uint32_t hash;
+    int zofs;
+    VkShaderModule mod;
+} FsProg;
+#define VKB_MAX_FS 2048
 
 /* A vertex program compiled for the GPU (draw_vsh), by content. */
 typedef struct {
@@ -115,6 +131,7 @@ typedef struct {
     VkBuffer stage[64];
     VkDeviceMemory stage_mem[64];
     int nstage;
+    int ts_valid;                   /* timestamps written in this submission */
 } Frame;
 
 static struct {
@@ -132,6 +149,8 @@ static struct {
     int npipes;
     VshProg vsh[VKB_MAX_VSH];
     int nvsh;
+    FsProg fsp[VKB_MAX_FS];
+    int nfsp;
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -161,6 +180,13 @@ static struct {
 
 static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
 
+/* Per-present statistics: fence waits in begin_frame, submits, uploads. */
+static long long s_stat_wait;
+static unsigned s_stat_begins, s_stat_uploads;
+static unsigned s_stat_passes, s_stat_barriers, s_stat_copies, s_stat_draws;
+static double s_stat_gpu_ms;            /* GPU time of the submissions, by timestamps */
+static VkQueryPool s_qpool;
+
 /* ---------------------------------------------------------------------- */
 
 static int fail(const char *what, VkResult r)
@@ -176,6 +202,7 @@ static void img_barrier(VkCommandBuffer cmd, VkImage img, int depth,
                         VkImageLayout from, VkImageLayout to)
 {
     VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    s_stat_barriers++;
     b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.oldLayout = from;
@@ -260,9 +287,7 @@ static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *bu
 
 static Frame *cur(void) { return &B.f[B.fi]; }
 
-/* Per-present statistics: fence waits in begin_frame, submits, uploads. */
-static long long s_stat_wait;
-static unsigned s_stat_begins, s_stat_uploads;
+
 
 static void begin_frame(void)
 {
@@ -280,6 +305,14 @@ static void begin_frame(void)
         QueryPerformanceCounter(&t1);
         s_stat_wait += t1.QuadPart - t0.QuadPart;
         s_stat_begins++;
+        if (s_qpool && f->ts_valid) {
+            uint64_t ts[2];
+            if (vkGetQueryPoolResults(B.dev, s_qpool, (uint32_t)(B.fi * 2), 2, sizeof ts, ts,
+                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                s_stat_gpu_ms += (double)(ts[1] - ts[0])
+                               * B.c->props.limits.timestampPeriod / 1e6;
+            f->ts_valid = 0;
+        }
     }
     vkResetFences(B.dev, 1, &f->fence);
     for (i = 0; i < f->nstage; i++) {
@@ -293,6 +326,11 @@ static void begin_frame(void)
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f->cmd, &bi);
     f->recording = 1;
+    if (s_qpool) {
+        vkCmdResetQueryPool(f->cmd, s_qpool, (uint32_t)(B.fi * 2), 2);
+        vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_qpool,
+                            (uint32_t)(B.fi * 2));
+    }
 }
 
 static void end_rendering(void)
@@ -312,6 +350,11 @@ static void submit_frame(void)
     if (!f->recording)
         return;
     end_rendering();
+    if (s_qpool) {
+        vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_qpool,
+                            (uint32_t)(B.fi * 2 + 1));
+        f->ts_valid = 1;
+    }
     vkEndCommandBuffer(f->cmd);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &f->cmd;
@@ -489,6 +532,7 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
         ri.pStencilAttachment = &da;
     }
     vkCmdBeginRendering(cur()->cmd, &ri);
+    s_stat_passes++;
     B.rendering = 1;
     B.rt_color = c;
     B.rt_depth = d;
@@ -711,6 +755,7 @@ static VkImageView texture_view(const Nv2aTexStage *st)
             rgn.extent.width = s->w;
             rgn.extent.height = s->h;
             rgn.extent.depth = 1;
+            s_stat_copies++;
             vkCmdCopyImage(cur()->cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            copy.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
             img_barrier(cur()->cmd, copy.img, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -895,6 +940,66 @@ static const char *FS_SRC =
     "  uvec4 cicw[2]; uvec4 aicw[2]; uvec4 cocw[2]; uvec4 aocw[2]; uvec4 f0[2]; uvec4 f1[2];\n"
     "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; uvec4 shadow; vec4 shadowmax;\n"
     "  uvec4 border; uvec4 bmask; } rc;\n"
+    /* The per-draw configuration as specialization constants: the driver
+     * compiles one shader per combiner set-up, loops unrolled and the
+     * register file in registers (see SPEC_N). */
+    "layout(constant_id=0) const uint S0 = 0u;\n"
+    "layout(constant_id=1) const uint S1 = 0u;\n"
+    "layout(constant_id=2) const uint S2 = 0u;\n"
+    "layout(constant_id=3) const uint S3 = 0u;\n"
+    "layout(constant_id=4) const uint S4 = 0u;\n"
+    "layout(constant_id=5) const uint S5 = 0u;\n"
+    "layout(constant_id=6) const uint S6 = 0u;\n"
+    "layout(constant_id=7) const uint S7 = 0u;\n"
+    "layout(constant_id=8) const uint S8 = 0u;\n"
+    "layout(constant_id=9) const uint S9 = 0u;\n"
+    "layout(constant_id=10) const uint S10 = 0u;\n"
+    "layout(constant_id=11) const uint S11 = 0u;\n"
+    "layout(constant_id=12) const uint S12 = 0u;\n"
+    "layout(constant_id=13) const uint S13 = 0u;\n"
+    "layout(constant_id=14) const uint S14 = 0u;\n"
+    "layout(constant_id=15) const uint S15 = 0u;\n"
+    "layout(constant_id=16) const uint S16 = 0u;\n"
+    "layout(constant_id=17) const uint S17 = 0u;\n"
+    "layout(constant_id=18) const uint S18 = 0u;\n"
+    "layout(constant_id=19) const uint S19 = 0u;\n"
+    "layout(constant_id=20) const uint S20 = 0u;\n"
+    "layout(constant_id=21) const uint S21 = 0u;\n"
+    "layout(constant_id=22) const uint S22 = 0u;\n"
+    "layout(constant_id=23) const uint S23 = 0u;\n"
+    "layout(constant_id=24) const uint S24 = 0u;\n"
+    "layout(constant_id=25) const uint S25 = 0u;\n"
+    "layout(constant_id=26) const uint S26 = 0u;\n"
+    "layout(constant_id=27) const uint S27 = 0u;\n"
+    "layout(constant_id=28) const uint S28 = 0u;\n"
+    "layout(constant_id=29) const uint S29 = 0u;\n"
+    "layout(constant_id=30) const uint S30 = 0u;\n"
+    "layout(constant_id=31) const uint S31 = 0u;\n"
+    "layout(constant_id=32) const uint S32 = 0u;\n"
+    "layout(constant_id=33) const uint S33 = 0u;\n"
+    "layout(constant_id=34) const uint S34 = 0u;\n"
+    "layout(constant_id=35) const uint S35 = 0u;\n"
+    "layout(constant_id=36) const uint S36 = 0u;\n"
+    "layout(constant_id=37) const uint S37 = 0u;\n"
+    "layout(constant_id=38) const uint S38 = 0u;\n"
+    "layout(constant_id=39) const uint S39 = 0u;\n"
+    "layout(constant_id=40) const uint S40 = 0u;\n"
+    "layout(constant_id=41) const uint S41 = 0u;\n"
+    "layout(constant_id=42) const uint S42 = 0u;\n"
+    "layout(constant_id=43) const uint S43 = 0u;\n"
+    /* Alpha test (enable, func, ref): a shader that can discard loses the
+     * early depth test, so only the pipelines that alpha-test may. */
+    "layout(constant_id=44) const uint S44 = 0u;\n"
+    "layout(constant_id=45) const uint S45 = 0u;\n"
+    "layout(constant_id=46) const uint S46 = 0u;\n"
+    "uint sc_cicw(uint i) { return i == 0u ? S0 : i == 1u ? S1 : i == 2u ? S2 : i == 3u ? S3 : i == 4u ? S4 : i == 5u ? S5 : i == 6u ? S6 : S7; }\n"
+    "uint sc_aicw(uint i) { return i == 0u ? S8 : i == 1u ? S9 : i == 2u ? S10 : i == 3u ? S11 : i == 4u ? S12 : i == 5u ? S13 : i == 6u ? S14 : S15; }\n"
+    "uint sc_cocw(uint i) { return i == 0u ? S16 : i == 1u ? S17 : i == 2u ? S18 : i == 3u ? S19 : i == 4u ? S20 : i == 5u ? S21 : i == 6u ? S22 : S23; }\n"
+    "uint sc_aocw(uint i) { return i == 0u ? S24 : i == 1u ? S25 : i == 2u ? S26 : i == 3u ? S27 : i == 4u ? S28 : i == 5u ? S29 : i == 6u ? S30 : S31; }\n"
+    "const uvec4 SC_CTL = uvec4(S32, S33, S34, S35);\n"
+    "const uvec4 SC_FIN = uvec4(S36, S37, 0u, 0u);\n"
+    "const uvec4 SC_SH = uvec4(S38, S39, S40, 0u);\n"
+    "const uvec4 SC_MISC = uvec4(S41, S42, 0u, S43);\n"
     "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 outColor;\n"
     /* A port of the executor's own CPU combiner (nv2a_combiner.c) and
@@ -932,7 +1037,7 @@ static const char *FS_SRC =
      * clampmin/clampmax bracket by half a texel. Clamping instead stretched
      * the edge texels outward -- shadows of whatever sat on a cascade's edge
      * spread over the ground, changing as the cascades moved with the view. */
-    "  uint bm = (rc.bmask.x >> uint(st * 2)) & 3u;\n"
+    "  uint bm = (SC_SH.z >> uint(st * 2)) & 3u;\n"
     "  vec2 lim = mx.x > 0.0 ? mx + mn : vec2(1.0);\n"
     "  if (bm != 0u\n"
     "      && (((bm & 1u) != 0u && (uv.x < 0.0 || uv.x > lim.x))\n"
@@ -945,8 +1050,8 @@ static const char *FS_SRC =
     "  return texture(tex[3], uv);\n"
     "}\n"
     "float fog_factor(float d) {\n"
-    "  float f, px = rc.fogp.x, py = rc.fogp.y; uint m = rc.misc.w;\n"
-    "  if (rc.misc.y == 0u || pc.alpha.w == 8) return 1.0;\n"
+    "  float f, px = rc.fogp.x, py = rc.fogp.y; uint m = SC_MISC.w;\n"
+    "  if (SC_MISC.y == 0u || pc.alpha.w == 8) return 1.0;\n"
     "  if (m == 0x800u || m == 0x802u) f = px + exp2(d * py * 16.0) - 1.5;\n"
     "  else if (m == 0x801u || m == 0x803u) f = px + exp2(-d * d * py * py * 32.0) - 1.5;\n"
     "  else f = px + d * py - 1.0;\n"
@@ -955,8 +1060,8 @@ static const char *FS_SRC =
     "  return clamp(f, 0.0, 1.0);\n"
     "}\n"
     "bool alpha_pass(float a) {\n"
-    "  int v = int(a * 255.0 + 0.5), r = pc.alpha.z;\n"
-    "  switch (pc.alpha.y) {\n"
+    "  int v = int(a * 255.0 + 0.5), r = int(S46);\n"
+    "  switch (int(S45)) {\n"
     "  case 0x200: return false; case 0x201: return v < r; case 0x202: return v == r;\n"
     "  case 0x203: return v <= r; case 0x204: return v > r; case 0x205: return v != r;\n"
     "  case 0x206: return v >= r; default: return true; }\n"
@@ -970,7 +1075,7 @@ static const char *FS_SRC =
     "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu)));\n"
     "#endif\n"
     "  vec4 c;\n"
-    "  if (rc.ctl.w == 0u) {\n"
+    "  if (SC_CTL.w == 0u) {\n"
     /* No combiner state yet: texture 0 times diffuse, as the CPU path. */
     "    c = vD0;\n"
     "    if (pc.texscale[0].z != 0.0) {\n"
@@ -979,16 +1084,16 @@ static const char *FS_SRC =
     "    }\n"
     "  } else {\n"
     "    vec4 t[4];\n"
-    "    uint sp = rc.ctl.y;\n"
+    "    uint sp = SC_CTL.y;\n"
     "    for (int st = 0; st < 4; st++) {\n"
     "      uint mode = (sp >> uint(st * 5)) & 31u;\n"
     "      vec4 tc = vT[st]; float q = tc.w != 0.0 ? tc.w : 1.0;\n"
     "      if (mode == 0u) t[st] = vec4(0.0, 0.0, 0.0, 1.0);\n"
-    "      else if ((mode == 1u || mode == 2u) && ((rc.shadow.x >> uint(st)) & 1u) != 0u) {\n"
+    "      else if ((mode == 1u || mode == 2u) && ((SC_SH.x >> uint(st)) & 1u) != 0u) {\n"
     /* Shadow map (xemu psh_append_shadowmap): stored depth <func> z/w. */
     "        float d = samp(st, tc.xy / q * pc.texscale[st].xy).r * rc.shadowmax[st];\n"
     "        float z = clamp(tc.z / q, 0.0, rc.shadowmax[st]);\n"
-    "        bool r; uint f = rc.shadow.y;\n"
+    "        bool r; uint f = SC_SH.y;\n"
     "        if (f == 0u) r = false; else if (f == 1u) r = d < z; else if (f == 2u) r = d == z;\n"
     "        else if (f == 3u) r = d <= z; else if (f == 4u) r = d > z; else if (f == 5u) r = d != z;\n"
     "        else if (f == 6u) r = d >= z; else r = true;\n"
@@ -1012,12 +1117,12 @@ static const char *FS_SRC =
     "      else if (mode == 4u) t[st] = clamp(tc, 0.0, 1.0);\n"
     "      else if (mode == 5u) {\n"
     "        for (int j = 0; j < 4; j++) {\n"
-    "          bool ge = ((rc.misc.x >> uint(st * 4 + j)) & 1u) != 0u;\n"
+    "          bool ge = ((SC_MISC.x >> uint(st * 4 + j)) & 1u) != 0u;\n"
     "          if (ge ? tc[j] >= 0.0 : tc[j] < 0.0) discard;\n"
     "        }\n"
     "        t[st] = vec4(0.0);\n"
     "      } else if (mode == 15u || mode == 16u) {\n"
-    "        int src = st <= 1 ? 0 : int((rc.ctl.z >> (st == 2 ? 16u : 20u)) & 15u) % st;\n"
+    "        int src = st <= 1 ? 0 : int((SC_CTL.z >> (st == 2 ? 16u : 20u)) & 15u) % st;\n"
     "        vec4 i = t[src];\n"
     "        vec2 dc = mode == 15u ? vec2(pc.alpha.w == 4 ? 0.5 : i.a, i.r) : vec2(i.g, i.b);\n"
     "        t[st] = samp(st, dc * pc.texscale[st].xy);\n"
@@ -1030,10 +1135,10 @@ static const char *FS_SRC =
     "    if (pc.alpha.w == 20) { outColor = vec4(t[0].rgb, 1.0); return; }\n"
     "    if (pc.alpha.w == 21) { outColor = vec4(clamp(vD0.rgb, 0.0, 1.0), clamp(vD0.a, 0.0, 1.0)); return; }\n"
     "    R[12].a = (sp & 31u) != 0u ? t[0].a : 1.0;\n"
-    "    uint n = min(rc.ctl.x & 255u, 8u), flags = rc.ctl.x >> 8;\n"
+    "    uint n = min(SC_CTL.x & 255u, 8u), flags = SC_CTL.x >> 8;\n"
     "    for (uint s = 0u; s < n; s++) {\n"
-    "      uint icw = w8(rc.cicw, s), ocw = w8(rc.cocw, s);\n"
-    "      uint aicw = w8(rc.aicw, s), aocw = w8(rc.aocw, s);\n"
+    "      uint icw = sc_cicw(s), ocw = sc_cocw(s);\n"
+    "      uint aicw = sc_aicw(s), aocw = sc_aocw(s);\n"
     "      uint fl = ocw >> 12, afl = aocw >> 12;\n"
     "      R[1] = unpk(w8(rc.f0, (flags & 0x010u) != 0u ? s : 0u));\n"
     "      R[2] = unpk(w8(rc.f1, (flags & 0x100u) != 0u ? s : 0u));\n"
@@ -1066,8 +1171,8 @@ static const char *FS_SRC =
     "      if (pc.alpha.w >= 10 && pc.alpha.w < 20 && int(s) == pc.alpha.w - 10) {\n"
     "        outColor = vec4(clamp(R[12].rgb, 0.0, 1.0), clamp(R[12].a, 0.0, 1.0)); return; }\n"
     "    }\n"
-    "    if (rc.fin.x != 0u || rc.fin.y != 0u) {\n"
-    "      uint f0 = rc.fin.x, f1 = rc.fin.y, ff = f1 & 255u;\n"
+    "    if (SC_FIN.x != 0u || SC_FIN.y != 0u) {\n"
+    "      uint f0 = SC_FIN.x, f1 = SC_FIN.y, ff = f1 & 255u;\n"
     "      R[1] = unpk(rc.fin.z); R[2] = unpk(rc.fin.w);\n"
     "      vec3 a = (ff & 0x40u) != 0u ? 1.0 - R[5].rgb : R[5].rgb;\n"
     "      vec3 b = (ff & 0x20u) != 0u ? 1.0 - R[12].rgb : R[12].rgb;\n"
@@ -1079,13 +1184,13 @@ static const char *FS_SRC =
     "    } else c = R[12];\n"
     "  }\n"
     "  c = clamp(c, 0.0, 1.0);\n"
-    "  if (pc.alpha.w == 5 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[9].rgb, 1.0);\n"
-    "  if (pc.alpha.w == 6 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[8].rgb, 1.0);\n"
-    "  if (pc.alpha.w == 7 && rc.misc.y != 0u) c = vec4(vec3(fog_factor(vFog.x)), c.a);\n"
+    "  if (pc.alpha.w == 5 && ((SC_CTL.y >> 5) & 31u) == 15u) c = vec4(R[9].rgb, 1.0);\n"
+    "  if (pc.alpha.w == 6 && ((SC_CTL.y >> 5) & 31u) == 15u) c = vec4(R[8].rgb, 1.0);\n"
+    "  if (pc.alpha.w == 7 && SC_MISC.y != 0u) c = vec4(vec3(fog_factor(vFog.x)), c.a);\n"
     "  if (pc.alpha.w == 1) c = vec4(1.0, 0.0, 1.0, 1.0);\n"
     "  else if (pc.alpha.w == 2) c = vec4(vD0.rgb, 1.0);\n"
     "  else if (pc.alpha.w == 3) c = vec4(samp(0, vT[0].xy * pc.texscale[0].xy).rgb, 1.0);\n"
-    "  if (pc.alpha.x != 0 && !alpha_pass(c.a)) discard;\n"
+    "  if (S44 != 0u && !alpha_pass(c.a)) discard;\n"
     "  outColor = c;\n"
     "#ifdef ZOFS\n"
     "  gl_FragDepth = clamp((zu + rc.fogp.w + rc.fogp.z * zsl) * pc.surf.z, 0.0, 1.0);\n"
@@ -1167,9 +1272,52 @@ static int poly_offset_on(const Nv2aRenderState *rs, int has_depth)
         && (rs->poly_offset_factor != 0.0f || rs->poly_offset_bias != 0.0f);
 }
 
+/* The fragment shader for a set-up: generated once, then cached. NULL
+ * (use the uber-shader) when generation or compilation fails. */
+static VkShaderModule fs_get(const uint32_t *spec, int zofs)
+{
+    static char *buf;
+    uint32_t h = 2166136261u;
+    FsProg *p;
+    int i;
+
+    for (i = 0; i < SPEC_N; i++)
+        h = (h ^ spec[i]) * 16777619u;
+    h ^= (uint32_t)zofs;
+    for (i = 0; i < B.nfsp; i++)
+        if (B.fsp[i].hash == h && B.fsp[i].zofs == zofs
+            && !memcmp(B.fsp[i].spec, spec, sizeof B.fsp[i].spec))
+            return B.fsp[i].mod;
+    if (B.nfsp >= VKB_MAX_FS)
+        return VK_NULL_HANDLE;
+    if (!buf && !(buf = (char *)malloc(256u << 10)))
+        return VK_NULL_HANDLE;
+    p = &B.fsp[B.nfsp++];
+    memcpy(p->spec, spec, sizeof p->spec);
+    p->hash = h;
+    p->zofs = zofs;
+    p->mod = VK_NULL_HANDLE;
+    if (vk_psh_gen(spec, zofs, buf, 256u << 10))
+        p->mod = make_module(buf, 1);
+    if (!p->mod) {
+        static unsigned said;
+        if (said++ < 16)
+            fprintf(stderr, "[VKB] fragment shader generation failed (prog %05X ctl %08X)\n",
+                    spec[33], spec[32]);
+        if (getenv("RECOMP_VK_PSH_DUMP")) {
+            FILE *fp = fopen("psh_failed.glsl", "wb");
+            if (fp) { fputs(buf, fp); fclose(fp); }
+        }
+    }
+    return p->mod;
+}
+
 static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
 {
     uint64_t k0, k1, k2, k3 = s_vsh ? s_vsh->id : 0;
+    uint32_t hsh, specv[SPEC_N];
+    VkSpecializationMapEntry sme[SPEC_N];
+    VkSpecializationInfo spi;
     int i;
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo stages[2];
@@ -1203,10 +1351,21 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
        | ((uint64_t)(rs->stencil_write_mask & 0xFF) << 12)
        | ((uint64_t)(rs->stencil_fail & 0xFFFF) << 20) | ((uint64_t)(rs->stencil_zfail & 0xFFFF) << 36)
        | ((uint64_t)(rs->stencil_zpass & 0xFFF) << 52);
-    for (i = 0; i < B.npipes; i++)
-        if (B.pipes[i].key[0] == k0 && B.pipes[i].key[1] == k1 && B.pipes[i].key[2] == k2
-            && B.pipes[i].key[3] == k3)
-            return B.pipes[i].pipe;
+    {
+        static const uint32_t zero[SPEC_N];
+        const uint32_t *sp = s_spec ? s_spec : zero;
+        uint32_t h = (uint32_t)(k0 ^ (k0 >> 32) ^ k1 * 31 ^ (k1 >> 32) ^ k2 * 131 ^ (k2 >> 32)
+                                ^ k3 * 7919);
+        for (i = 0; i < SPEC_N; i++)
+            h = (h ^ sp[i]) * 16777619u;
+        hsh = h;
+        for (i = 0; i < B.npipes; i++)
+            if (B.pipes[i].hash == h && B.pipes[i].key[0] == k0 && B.pipes[i].key[1] == k1
+                && B.pipes[i].key[2] == k2 && B.pipes[i].key[3] == k3
+                && !memcmp(B.pipes[i].spec, sp, sizeof B.pipes[i].spec))
+                return B.pipes[i].pipe;
+        memcpy(specv, sp, sizeof specv);
+    }
     if (B.npipes >= VKB_MAX_PIPELINES)
         return B.pipes[0].pipe;
 
@@ -1217,7 +1376,29 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = ((k0 >> 58) & 1) ? B.fs_zofs : B.fs;
+    {
+        /* A shader generated for this set-up, unless a debug mode needs
+         * the uber-shader (RECOMP_VK_FS, RECOMP_VK_UBER=1). */
+        static int uber = -1;
+        if (uber < 0)
+            uber = getenv("RECOMP_VK_UBER") || getenv("RECOMP_VK_FS") || getenv("RECOMP_VK_FS_TRIVIAL");
+        if (!uber) {
+            VkShaderModule m = fs_get(specv, (int)((k0 >> 58) & 1));
+            if (m)
+                stages[1].module = m;
+        }
+    }
     stages[1].pName = "main";
+    for (i = 0; i < SPEC_N; i++) {
+        sme[i].constantID = (uint32_t)i;
+        sme[i].offset = (uint32_t)(i * 4);
+        sme[i].size = 4;
+    }
+    spi.mapEntryCount = SPEC_N;
+    spi.pMapEntries = sme;
+    spi.dataSize = sizeof specv;
+    spi.pData = specv;
+    stages[1].pSpecializationInfo = &spi;
     for (i = 0; i < 8; i++) {
         va[i].location = (uint32_t)i;
         va[i].binding = 0;
@@ -1314,6 +1495,8 @@ cull_done:
     B.pipes[B.npipes].key[1] = k1;
     B.pipes[B.npipes].key[2] = k2;
     B.pipes[B.npipes].key[3] = k3;
+    memcpy(B.pipes[B.npipes].spec, specv, sizeof specv);
+    B.pipes[B.npipes].hash = hsh;
     B.pipes[B.npipes++].pipe = p;
     return p;
 }
@@ -1351,6 +1534,15 @@ static int init(void)
     B.dev = B.c->dev;
     pfnPushDescriptor = (PFN_vkCmdPushDescriptorSetKHR)
         vkGetDeviceProcAddr(B.dev, "vkCmdPushDescriptorSetKHR");
+    {
+        /* Two timestamps per frame slot: GPU time per submission. */
+        VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = VKB_FRAMES * 2;
+        if (B.c->props.limits.timestampComputeAndGraphics
+            && vkCreateQueryPool(B.dev, &qi, NULL, &s_qpool) != VK_SUCCESS)
+            s_qpool = VK_NULL_HANDLE;
+    }
 
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = B.c->qfam;
@@ -1382,6 +1574,14 @@ static int init(void)
 
     B.vs = make_module(VS_SRC, 0);
     B.fs = make_module(FS_SRC, 1);
+    if (getenv("RECOMP_VK_FS_TRIVIAL")) {
+        /* Diagnostic: the vertex colour only -- fill cost without the
+         * pixel shader's work. */
+        B.fs = make_module("#version 450\n"
+                           "layout(location=0) in vec4 vD0;\n"
+                           "layout(location=0) out vec4 outColor;\n"
+                           "void main() { outColor = vD0; }\n", 1);
+    }
     {
         /* The same shader with polygon offset (writes gl_FragDepth). */
         const char *ver = "#version 450\n";
@@ -1598,7 +1798,41 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
     f = cur();
     cmd = f->cmd;
-    pipe = get_pipeline(rs, B.rt_depth != NULL);
+    {
+        /* The specialization words (FS_SRC S0..S43), from the pixel state. */
+        static uint32_t spec[SPEC_N];
+        int k;
+        memset(spec, 0, sizeof spec);
+        if (px) {
+            memcpy(spec + 0, px->color_icw, 32);
+            memcpy(spec + 8, px->alpha_icw, 32);
+            memcpy(spec + 16, px->color_ocw, 32);
+            memcpy(spec + 24, px->alpha_ocw, 32);
+            spec[32] = px->control;
+            spec[33] = px->stage_program;
+            spec[34] = px->other_stage_input;
+            spec[35] = px->rc_seen;
+            spec[36] = px->final0;
+            spec[37] = px->final1;
+            spec[39] = px->shadow_func;
+            spec[41] = px->clip_plane_mode;
+            spec[42] = px->fog_enable;
+            spec[43] = px->fog_mode;
+        }
+        spec[38] = shadow_mask;
+        spec[44] = rs->alpha_test_enable ? 1u : 0u;
+        spec[45] = rs->alpha_test_enable ? rs->alpha_func : 0u;
+        spec[46] = rs->alpha_test_enable ? (rs->alpha_ref & 0xFF) : 0u;
+        for (k = 0; stages && k < 4; k++) {
+            if (!stages[k].enabled || !(stages[k].format_word & 0x8u))
+                continue;
+            if ((stages[k].t.addr_u & 7) == 4) spec[40] |= 1u << (k * 2);
+            if ((stages[k].t.addr_v & 7) == 4) spec[40] |= 2u << (k * 2);
+        }
+        s_spec = spec;
+        pipe = get_pipeline(rs, B.rt_depth != NULL);
+        s_spec = NULL;
+    }
     if (!pipe)
         return;
 
@@ -1751,6 +1985,13 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         sc.extent.width = x1 > x0 ? x1 - x0 : 0;
         sc.extent.height = y1 > y0 ? y1 - y0 : 0;
     }
+    {
+        /* RECOMP_VK_TINY=1: a 1x1 scissor -- the frame without its pixel
+         * work, to tell vertex/draw cost from fill cost (diagnostic). */
+        static int tiny = -1;
+        if (tiny < 0) tiny = getenv("RECOMP_VK_TINY") != NULL;
+        if (tiny) { sc.extent.width = sc.extent.width ? 1 : 0; sc.extent.height = sc.extent.height ? 1 : 0; }
+    }
     vkCmdSetScissor(cmd, 0, 1, &sc);
     {
         float bc[4] = { ((rs->blend_color >> 16) & 0xFF) / 255.0f,
@@ -1761,6 +2002,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
     vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, rs->stencil_ref & 0xFF);
     vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
+    s_stat_draws++;
     if (s_vsh) {
         vkCmdBindIndexBuffer(cmd, f->vbuf, off + ((vbytes + 255u) & ~255u), VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, s_vsh->nindices, 1, 0, 0, 0);
@@ -2503,11 +2745,17 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                 LARGE_INTEGER fq;
                 QueryPerformanceFrequency(&fq);
                 fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures) | per frame: "
-                        "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU\n",
+                        "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU, GPU busy %.2f ms, "
+                        "%.0f draws, %.0f passes, %.0f barriers, %.1f copies\n",
                         frames * 1000.0 / (now - t0), B.npipes, B.ntex,
                         (double)s_stat_begins / frames, (double)s_stat_uploads / frames,
-                        (double)s_stat_wait * 1000.0 / fq.QuadPart / frames);
+                        (double)s_stat_wait * 1000.0 / fq.QuadPart / frames,
+                        s_stat_gpu_ms / frames, (double)s_stat_draws / frames,
+                        (double)s_stat_passes / frames, (double)s_stat_barriers / frames,
+                        (double)s_stat_copies / frames);
                 s_stat_wait = 0; s_stat_begins = 0; s_stat_uploads = 0;
+                s_stat_gpu_ms = 0; s_stat_draws = 0; s_stat_passes = 0;
+                s_stat_barriers = 0; s_stat_copies = 0;
                 frames = 0;
                 t0 = now;
             }
