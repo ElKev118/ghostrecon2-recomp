@@ -1503,6 +1503,26 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
     vkCmdDraw(cmd, count, 1, 0, 0);
     {
+        /* RECOMP_VK_SYNC_EACH=1: end rendering + full barrier after every
+         * draw; =2: also submit and wait. Hazard hunting. */
+        static int mode = -1;
+        if (mode < 0) { const char *e = getenv("RECOMP_VK_SYNC_EACH"); mode = e ? atoi(e) : 0; }
+        if (mode >= 1) {
+            VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            end_rendering();
+            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            B.rt_color = NULL;
+        }
+        if (mode >= 2) {
+            submit_frame();
+            vkDeviceWaitIdle(B.dev);
+            begin_frame();
+        }
+    }
+    {
         /* RECOMP_VK_PROBE=x,y (+ flag file probe.flag): for one frame, read
          * pixel (x,y) of the colour target after every draw and log it with
          * the draw's state -- which draw turns a pixel wrong. */
@@ -1533,7 +1553,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                         size_t k, np = (size_t)t->w * t->h; unsigned cyan = 0;
                         for (k = 0; k < np; k++) {
                             int bb = mp[k*4], gg = mp[k*4+1], rr = mp[k*4+2];
-                            if (gg > rr + 25 && bb > rr + 20) cyan++;
+                            if (rr + gg + bb < 24) cyan++;     /* dark: see PROBE_METRIC */
                         }
                         {
                             unsigned long long sum = 0;
