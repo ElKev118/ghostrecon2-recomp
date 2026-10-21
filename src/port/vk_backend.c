@@ -107,7 +107,7 @@ static struct {
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
-    VkShaderModule vs, fs;
+    VkShaderModule vs, fs, fs_zofs;
     VkSampler samplers[64];
     uint32_t sampler_keys[64];
     int nsamplers;
@@ -564,6 +564,18 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
  * draws its 256x256 grade table into an address it also uses as a 640x480
  * buffer), so coordinates must be scaled to the part that holds the data. */
 static uint32_t s_view_w, s_view_h;
+/* RECOMP_VK_PROBE: 1 = flag file seen, 2 = a present happened since,
+ * 3 = probing, 4 = the probed frame was presented. */
+static int s_probe_armed;
+#define PROBE_MAX 4000
+#define PROBE_R   32
+typedef struct {
+    uint32_t ok, surf, count, blend, bsrc, bdst, cmask, sp, ctl, f0, f1, t0, t0f, t1, t1f;
+} ProbeRec;
+static ProbeRec s_probe_rec[PROBE_MAX];
+static VkBuffer s_probe_buf;
+static VkDeviceMemory s_probe_mem;
+static uint8_t *s_probe_map;
 /* texture_view found a depth texture: a shadow-map stage (compare, not colour). */
 static int s_view_depth;
 
@@ -791,8 +803,15 @@ static const char *VS_SRC =
     /* pos is surface pixels and depth units, divided by w; rebuild clip
      * space so the GPU clips against the near plane itself. */
     "  float w = inPos.w;\n"
-    "  vec3 ndc = vec3(inPos.x / pc.surf.x * 2.0 - 1.0,\n"
-    "                  inPos.y / pc.surf.y * 2.0 - 1.0,\n"
+    /* The NV2A keeps 4 bits of sub-pixel precision: truncate to 1/16 as
+     * xemu's roundScreenCoords does. Titles add D3D's 0.53125 screen offset;
+     * truncated to 0.5 it lands on the first pixel centre (covered, top-left
+     * rule), unrounded it misses row and column 0 -- Ghost Recon 2's colour
+     * grade table then had a black column 0, and every scene pixel with
+     * alpha 0 lost its red (the cyan ground). */
+    "  vec2 sp = trunc(inPos.xy * 16.0) / 16.0;\n"
+    "  vec3 ndc = vec3(sp.x / pc.surf.x * 2.0 - 1.0,\n"
+    "                  sp.y / pc.surf.y * 2.0 - 1.0,\n"
     "                  inPos.z * pc.surf.z);\n"
     "  gl_Position = vec4(ndc * w, w);\n"
     "  vD0 = inD0; vD1 = inD1; vFog = inFog;\n"
@@ -846,7 +865,7 @@ static const char *FS_SRC =
     "}\n"
     "float fog_factor(float d) {\n"
     "  float f, px = rc.fogp.x, py = rc.fogp.y; uint m = rc.misc.w;\n"
-    "  if (rc.misc.y == 0u) return 1.0;\n"
+    "  if (rc.misc.y == 0u || pc.alpha.w == 8) return 1.0;\n"
     "  if (m == 0x800u || m == 0x802u) f = px + exp2(d * py * 16.0) - 1.5;\n"
     "  else if (m == 0x801u || m == 0x803u) f = px + exp2(-d * d * py * py * 32.0) - 1.5;\n"
     "  else f = px + d * py - 1.0;\n"
@@ -862,6 +881,13 @@ static const char *FS_SRC =
     "  case 0x206: return v >= r; default: return true; }\n"
     "}\n"
     "void main() {\n"
+    /* Polygon offset (xemu: zvalue += depthOffset + depthFactor * slope), in
+     * depth units; only the ZOFS variant writes depth, so every other draw
+     * keeps early depth testing. */
+    "#ifdef ZOFS\n"
+    "  float zu = gl_FragCoord.z / pc.surf.z;\n"
+    "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu)));\n"
+    "#endif\n"
     "  vec4 c;\n"
     "  if (rc.ctl.w == 0u) {\n"
     /* No combiner state yet: texture 0 times diffuse, as the CPU path. */
@@ -885,6 +911,7 @@ static const char *FS_SRC =
     "        if (f == 0u) r = false; else if (f == 1u) r = d < z; else if (f == 2u) r = d == z;\n"
     "        else if (f == 3u) r = d <= z; else if (f == 4u) r = d > z; else if (f == 5u) r = d != z;\n"
     "        else if (f == 6u) r = d >= z; else r = true;\n"
+    "        if (rc.shadow.z == 1u) r = false; else if (rc.shadow.z == 2u) r = true;\n"
     "        t[st] = vec4(r ? 1.0 : 0.0);\n"
     "      }\n"
     "      else if (mode == 1u || mode == 2u || mode == 3u)\n"
@@ -956,11 +983,15 @@ static const char *FS_SRC =
     "  c = clamp(c, 0.0, 1.0);\n"
     "  if (pc.alpha.w == 5 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[9].rgb, 1.0);\n"
     "  if (pc.alpha.w == 6 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[8].rgb, 1.0);\n"
+    "  if (pc.alpha.w == 7 && rc.misc.y != 0u) c = vec4(vec3(fog_factor(vFog.x)), c.a);\n"
     "  if (pc.alpha.w == 1) c = vec4(1.0, 0.0, 1.0, 1.0);\n"
     "  else if (pc.alpha.w == 2) c = vec4(vD0.rgb, 1.0);\n"
     "  else if (pc.alpha.w == 3) c = vec4(samp(0, vT[0].xy * pc.texscale[0].xy).rgb, 1.0);\n"
     "  if (pc.alpha.x != 0 && !alpha_pass(c.a)) discard;\n"
     "  outColor = c;\n"
+    "#ifdef ZOFS\n"
+    "  gl_FragDepth = clamp((zu + rc.fogp.w + rc.fogp.z * zsl) * pc.surf.z, 0.0, 1.0);\n"
+    "#endif\n"
     "}\n";
 
 static VkShaderModule make_module(const char *src, int frag)
@@ -1031,6 +1062,13 @@ static VkStencilOp stencil_op(uint32_t o)
     }
 }
 
+/* SET_POLY_OFFSET_FILL_ENABLE with a non-zero offset, onto a depth target. */
+static int poly_offset_on(const Nv2aRenderState *rs, int has_depth)
+{
+    return has_depth && rs->poly_offset_fill
+        && (rs->poly_offset_factor != 0.0f || rs->poly_offset_bias != 0.0f);
+}
+
 static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
 {
     uint64_t k0, k1, k2;
@@ -1059,7 +1097,8 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
        | ((uint64_t)(rs->blend_dst & 0xFFFF) << 17) | ((uint64_t)(rs->blend_eq & 0xFFFF) << 33)
        | ((uint64_t)(rs->depth_test_enable & 1) << 49) | ((uint64_t)(rs->depth_func & 0xF) << 50)
        | ((uint64_t)(rs->depth_write & 1) << 54) | ((uint64_t)(has_depth & 1) << 55)
-       | ((uint64_t)(rs->cull_enable & 1) << 56) | ((uint64_t)(rs->stencil_enable & 1) << 57);
+       | ((uint64_t)(rs->cull_enable & 1) << 56) | ((uint64_t)(rs->stencil_enable & 1) << 57)
+       | ((uint64_t)poly_offset_on(rs, has_depth) << 58);
     k1 = (uint64_t)rs->color_mask | ((uint64_t)(rs->cull_face & 0xFFFF) << 32)
        | ((uint64_t)(rs->front_face & 0xFFFF) << 48);
     k2 = (uint64_t)(rs->stencil_func & 0xF) | ((uint64_t)(rs->stencil_func_mask & 0xFF) << 4)
@@ -1078,7 +1117,7 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     stages[0].module = B.vs;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = B.fs;
+    stages[1].module = ((k0 >> 58) & 1) ? B.fs_zofs : B.fs;
     stages[1].pName = "main";
     for (i = 0; i < 8; i++) {
         va[i].location = (uint32_t)i;
@@ -1230,7 +1269,18 @@ static int init(void)
 
     B.vs = make_module(VS_SRC, 0);
     B.fs = make_module(FS_SRC, 1);
-    if (!B.vs || !B.fs) {
+    {
+        /* The same shader with polygon offset (writes gl_FragDepth). */
+        const char *ver = "#version 450\n";
+        size_t n = strlen(FS_SRC) + 32;
+        char *src = (char *)malloc(n);
+        if (src && !strncmp(FS_SRC, ver, strlen(ver))) {
+            snprintf(src, n, "%s#define ZOFS\n%s", ver, FS_SRC + strlen(ver));
+            B.fs_zofs = make_module(src, 1);
+        }
+        free(src);
+    }
+    if (!B.vs || !B.fs || !B.fs_zofs) {
         B.failed = 1;
         return 0;
     }
@@ -1320,6 +1370,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         s_view_w = s_view_h = 0;
         s_view_depth = 0;
         view = stages ? texture_view(&stages[st]) : NULL;
+        if (stages && stages[st].enabled && is_depth_format(stages[st].t.color)) {
+            static unsigned said;
+            if (said++ < 40)
+                fprintf(stderr, "[VKB] shadow stage %d: tex %08X %ux%u fmt %02X norm %u func %u "
+                        "-> %s %ux%u, v0 tc %.3f %.3f %.3f %.3f\n",
+                        st, stages[st].t.offset, stages[st].t.width, stages[st].t.height,
+                        stages[st].t.color, stages[st].normalised, px ? px->shadow_func : 99,
+                        view ? (s_view_depth ? "depth" : "COLOUR?") : "NONE(white)",
+                        s_view_w, s_view_h,
+                        v[0].tex[st][0], v[0].tex[st][1],
+                        v[0].tex[st][2], v[0].tex[st][3]);
+        }
         if (view && s_view_depth) {
             shadow_mask |= 1u << st;
             shadow_max[st] = (stages[st].t.color == 0x2C || stages[st].t.color == 0x2D
@@ -1373,6 +1435,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             ii[st].sampler = B.samplers[0];
     if (!bind_target(sf, rs->zeta_va))
         return;
+    if (rs->zeta_va && (rs->zeta_va & 0x0FFFFFFFu) == 0x00A17000u) {
+        /* Shadow-map renders: the depth format they write decides the
+         * scale the compare must use. */
+        static unsigned said;
+        if (said++ < 12)
+            fprintf(stderr, "[VKB] shadow-map render: colour %08X zeta %08X fmt %u zmax %.0f "
+                    "%ux%u, v0 z %.3f w %.3f, poly offset %u factor %g bias %g\n",
+                    sf->color_va, rs->zeta_va,
+                    px ? px->zeta_format : 99, zmax, sf->width, sf->height,
+                    v[0].pos[2], v[0].pos[3], rs->poly_offset_fill,
+                    rs->poly_offset_factor, rs->poly_offset_bias);
+    }
     {
         /* RECOMP_VK_WATCH=<va>: log the draws that target one surface. */
         static uint32_t watch = 1;
@@ -1427,6 +1501,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         ubo.misc[0] = px->clip_plane_mode; ubo.misc[1] = px->fog_enable;
         ubo.misc[2] = px->fog_color; ubo.misc[3] = px->fog_mode;
         ubo.fogp[0] = px->fog_param[0]; ubo.fogp[1] = px->fog_param[1];
+        ubo.fogp[2] = rs->poly_offset_factor;   /* read only by the ZOFS shader */
+        ubo.fogp[3] = rs->poly_offset_bias;
     }
     {
         int k;
@@ -1437,6 +1513,16 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
     ubo.shadow[0] = shadow_mask;
     ubo.shadow[1] = px ? px->shadow_func : 0;
+    {
+        /* RECOMP_VK_SHADOW=0|1: force every shadow-map compare to fail or
+         * pass (diagnostic: is the compare what darkens the ground?). */
+        static int force = -2;
+        if (force == -2) {
+            const char *e = getenv("RECOMP_VK_SHADOW");
+            force = e ? atoi(e) + 1 : 0;
+        }
+        ubo.shadow[2] = (uint32_t)force;
+    }
     memcpy(ubo.shadowmax, shadow_max, sizeof shadow_max);
     memcpy(f->umap + f->uused, &ubo, sizeof ubo);
     ubi.buffer = f->ubuf;
@@ -1460,9 +1546,12 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             const char *e = getenv("RECOMP_VK_FS");
             dbg = !e ? 0 : !strcmp(e, "magenta") ? 1 : !strcmp(e, "d0") ? 2
                 : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4
-                : !strcmp(e, "gradeAR") ? 5 : !strcmp(e, "gradeT0") ? 6 : 0;
+                : !strcmp(e, "gradeAR") ? 5 : !strcmp(e, "gradeT0") ? 6
+                : !strcmp(e, "fog") ? 7 : !strcmp(e, "nofog") ? 8 : 0;
         }
-        pc.alpha[3] = dbg;
+        /* Not on full-screen quads: the post-process passes would paint
+         * the debug output over the whole scene. */
+        pc.alpha[3] = (dbg >= 2 && dbg != 5 && dbg != 6 && count <= 6) ? 0 : dbg;
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1533,50 +1622,91 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             if (e) sscanf(e, "%d,%d", &px, &py);
         }
         if (px >= 0 && !done) {
-            if (!active && GetFileAttributesA("probe.flag") != INVALID_FILE_ATTRIBUTES)
+            /* Start at a frame boundary (the next present), so the log
+             * covers one whole frame from its first draw. */
+            if (!active && !s_probe_armed
+                && GetFileAttributesA("probe.flag") != INVALID_FILE_ATTRIBUTES)
+                s_probe_armed = 1;
+            if (!active && s_probe_armed == 2) {
                 active = 1;
-            if (active && B.rt_color && (uint32_t)px < B.rt_color->w && (uint32_t)py < B.rt_color->h) {
-                VkBuffer pb; VkDeviceMemory pm; uint8_t *mp; VkBufferImageCopy c;
+                s_probe_armed = 3;
+                fprintf(stderr, "[PROBE] frame start\n");
+            }
+            if (active && B.rt_color && idx < PROBE_MAX) {
+                /* No CPU wait per draw (a stalled frame makes the title
+                 * switch to its loading logo): copy a PROBE_R square around
+                 * (x,y) into this draw's slot and read them all at the end. */
                 Surface *t = B.rt_color;
-                if (make_buffer((VkDeviceSize)t->w * t->h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &pb, &pm, (void **)&mp)) {
-                    to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                    memset(&c, 0, sizeof c);
-                    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    c.imageSubresource.layerCount = 1;
-                    c.imageExtent.width = t->w; c.imageExtent.height = t->h; c.imageExtent.depth = 1;
-                    vkCmdCopyImageToBuffer(cur()->cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pb, 1, &c);
-                    submit_frame();
-                    vkDeviceWaitIdle(B.dev);
-                    begin_frame();
-                    B.rt_color = NULL;
-                    {
-                        size_t k, np = (size_t)t->w * t->h; unsigned cyan = 0;
-                        for (k = 0; k < np; k++) {
-                            int bb = mp[k*4], gg = mp[k*4+1], rr = mp[k*4+2];
-                            if (rr + gg + bb < 24) cyan++;     /* dark: see PROBE_METRIC */
-                        }
-                        {
-                            unsigned long long sum = 0;
-                            for (k = 0; k < np; k++) sum += mp[k*4] + mp[k*4+1] + mp[k*4+2];
-                            fprintf(stderr, "[PROBE] sum %llu ", sum);
-                        }
-                        fprintf(stderr, "[PROBE] cyan %u ", cyan);
+                ProbeRec *r = &s_probe_rec[idx];
+                VkBufferImageCopy c;
+                int x0 = px - PROBE_R / 2, y0 = py - PROBE_R / 2;
+                if (!s_probe_buf && !make_buffer((VkDeviceSize)PROBE_MAX * PROBE_R * PROBE_R * 4,
+                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 &s_probe_buf, &s_probe_mem, (void **)&s_probe_map))
+                    done = 1;
+                if (!done) {
+                    if (x0 < 0) x0 = 0;
+                    if (y0 < 0) y0 = 0;
+                    if (x0 + PROBE_R > (int)t->w) x0 = (int)t->w - PROBE_R;
+                    if (y0 + PROBE_R > (int)t->h) y0 = (int)t->h - PROBE_R;
+                    r->ok = x0 >= 0 && y0 >= 0;
+                    r->surf = t->va; r->count = count;
+                    r->blend = rs->blend_enable; r->bsrc = rs->blend_src; r->bdst = rs->blend_dst;
+                    r->cmask = rs->color_mask;
+                    r->sp = px_state_sp; r->ctl = px_state_ctl; r->f0 = px_state_f0; r->f1 = px_state_f1;
+                    r->t0 = stages ? stages[0].t.offset : 0; r->t0f = stages ? stages[0].t.color : 0;
+                    r->t1 = stages ? stages[1].t.offset : 0; r->t1f = stages ? stages[1].t.color : 0;
+                    if (r->ok) {
+                        to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                        memset(&c, 0, sizeof c);
+                        c.bufferOffset = (VkDeviceSize)idx * PROBE_R * PROBE_R * 4;
+                        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        c.imageSubresource.layerCount = 1;
+                        c.imageOffset.x = x0; c.imageOffset.y = y0;
+                        c.imageExtent.width = PROBE_R; c.imageExtent.height = PROBE_R;
+                        c.imageExtent.depth = 1;
+                        vkCmdCopyImageToBuffer(cur()->cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               s_probe_buf, 1, &c);
+                        B.rt_color = NULL;
                     }
-                    fprintf(stderr, "[PROBE] #%d surf %08X n %u -> BGRA %3u %3u %3u %3u | blend %u %X/%X eq %X cmask %08X | prog %05X ctl %08X fin %08X %08X | rc_seen %u | t0 %08X fmt %02X t1 %08X fmt %02X\n",
-                            idx++, t->va, count, mp[0], mp[1], mp[2], mp[3],
-                            rs->blend_enable, rs->blend_src, rs->blend_dst, rs->blend_eq, rs->color_mask,
-                            px_state_sp, px_state_ctl, px_state_f0, px_state_f1, px_state_seen,
-                            stages ? stages[0].t.offset : 0, stages ? stages[0].t.color : 0,
-                            stages ? stages[1].t.offset : 0, stages ? stages[1].t.color : 0);
-                    vkDestroyBuffer(B.dev, pb, NULL);
-                    vkFreeMemory(B.dev, pm, NULL);
+                    idx++;
                 }
             }
         }
-        /* A whole frame: the post-process passes after the scene (onto the
-         * scene surface itself) are where the colour is decided. */
-        if (active && !done && idx > 2500)
+        /* One whole frame, from the first draw after a present to the next
+         * present. */
+        if (active && !done && (idx >= PROBE_MAX || s_probe_armed == 4)) {
+            int i;
             done = 1;
+            end_rendering();
+            submit_frame();
+            vkDeviceWaitIdle(B.dev);
+            begin_frame();
+            B.rt_color = NULL;
+            fprintf(stderr, "[PROBE] done after %d draws\n", idx);
+            for (i = 0; i < idx; i++) {
+                const ProbeRec *r = &s_probe_rec[i];
+                const uint8_t *m = s_probe_map + (size_t)i * PROBE_R * PROBE_R * 4;
+                const uint8_t *ce = m + ((PROBE_R / 2) * PROBE_R + PROBE_R / 2) * 4;
+                unsigned cyan = 0, dark = 0, k, sum = 0;
+                if (!r->ok) continue;
+                for (k = 0; k < PROBE_R * PROBE_R; k++) {
+                    int bb = m[k*4], gg = m[k*4+1], rr = m[k*4+2];
+                    sum += bb + gg + rr;
+                    if (rr + gg + bb < 24) dark++;
+                    else if (gg + bb > 60 && 2 * rr < gg && 2 * rr < bb) cyan++;
+                }
+                fprintf(stderr, "[PROBE] #%d surf %08X n %u | RGBA %3u %3u %3u %3u | sq dark %u cyan %u avg %u"
+                        " | blend %u %X/%X cmask %08X | prog %05X ctl %08X fin %08X %08X | t0 %08X fmt %02X t1 %08X fmt %02X\n",
+                        i, r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
+                        sum / (PROBE_R * PROBE_R * 3), r->blend, r->bsrc, r->bdst, r->cmask,
+                        r->sp, r->ctl, r->f0, r->f1, r->t0, r->t0f, r->t1, r->t1f);
+            }
+            fflush(stderr);
+            dump_surfaces("pr_", 0);
+            begin_frame();
+            B.rt_color = NULL;
+        }
     }
     {
         /* RECOMP_VK_WATCH_DUMP=<n>: read every surface back right after the
@@ -1610,6 +1740,47 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
 {
     if (B.failed)
         return;
+    {
+        /* RECOMP_VK_RC_DUMP=<prog hex>: the raw combiner registers of the
+         * first few draws with that stage program. */
+        static int want = -2, said;
+        if (want == -2) {
+            const char *e = getenv("RECOMP_VK_RC_DUMP");
+            want = e ? (int)strtoul(e, NULL, 16) : -1;
+        }
+        if (want >= 0 && b->pixel->stage_program == (uint32_t)want && said < 8
+            && (!getenv("RECOMP_VK_RC_W") || sf->width == (uint32_t)atoi(getenv("RECOMP_VK_RC_W")))
+            && (!getenv("RECOMP_VK_RC_T0")
+                || ((b->pixel->stage[0].t.offset ^ (uint32_t)strtoul(getenv("RECOMP_VK_RC_T0"), NULL, 16))
+                    & 0x0FFFFFFFu) == 0)) {
+            const Nv2aPixelState *p = b->pixel;
+            int i;
+            said++;
+            fprintf(stderr, "[RC] prog %05X control %08X final %08X %08X fc %08X %08X blend %u %X/%X\n",
+                    p->stage_program, p->control, p->final0, p->final1, p->final_c0, p->final_c1,
+                    b->state->blend_enable, b->state->blend_src, b->state->blend_dst);
+            for (i = 0; i < 8; i++)
+                fprintf(stderr, "[RC]  %d: cI %08X aI %08X cO %08X aO %08X f0 %08X f1 %08X\n", i,
+                        p->color_icw[i], p->alpha_icw[i], p->color_ocw[i], p->alpha_ocw[i],
+                        p->factor0[i], p->factor1[i]);
+            fprintf(stderr, "[RC]  target %08X %ux%u pitch %u, %u verts, zeta %08X fmt %u\n",
+                    sf->color_va, sf->width, sf->height, sf->pitch, b->count,
+                    b->state->zeta_va, p->zeta_format);
+            fprintf(stderr, "[RC]  depth test %u func %X write %u | stencil %u func %X ref %u mask %X"
+                    " wmask %X ops %X/%X/%X | alpha test %u %X %u | cmask %08X\n",
+                    b->state->depth_test_enable, b->state->depth_func, b->state->depth_write,
+                    b->state->stencil_enable, b->state->stencil_func, b->state->stencil_ref,
+                    b->state->stencil_func_mask, b->state->stencil_write_mask,
+                    b->state->stencil_fail, b->state->stencil_zfail, b->state->stencil_zpass,
+                    b->state->alpha_test_enable, b->state->alpha_func, b->state->alpha_ref,
+                    b->state->color_mask);
+            for (i = 0; i < (int)b->count && i < 6; i++)
+                fprintf(stderr, "[RC]  v%d pos %.3f %.3f %.3f %.3f t0 %.3f %.3f %.3f %.3f\n", i,
+                        b->vertices[i].pos[0], b->vertices[i].pos[1], b->vertices[i].pos[2],
+                        b->vertices[i].pos[3], b->vertices[i].tex[0][0], b->vertices[i].tex[0][1],
+                        b->vertices[i].tex[0][2], b->vertices[i].tex[0][3]);
+        }
+    }
     {
         /* Once: the inputs of the colour-grade pass (dependent stages). */
         static int said;
@@ -1722,10 +1893,18 @@ static void vkb_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         ca[n].aspectMask = ((flags & 1) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0)
                          | ((flags & 2) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
         ca[n].colorAttachment = 0;
-        /* Z24S8: depth in the top 24 bits. Z16 titles put it in the low 16
-         * (the executor tells us nothing better here; 24-bit is GR2's). */
-        ca[n].clearValue.depthStencil.depth = (float)(zs >> 8) / 16777215.0f;
-        ca[n].clearValue.depthStencil.stencil = zs & 0xFF;
+        /* xemu pgraph_get_clear_surface: Z16 keeps the depth in the low 16
+         * bits, Z24S8 in the top 24 with stencil below. Reading a Z16 clear
+         * as Z24 turned GR2's shadow maps' "far" (0xFFFF) into ~0, so every
+         * texel no caster covered compared as shadowed -- the dark ground. */
+        /* (Linear in both cases, as draws store z / zmax even for float Z.) */
+        if (rs->zeta_format == 1) {
+            ca[n].clearValue.depthStencil.depth = (float)(zs & 0xFFFF) / 65535.0f;
+            ca[n].clearValue.depthStencil.stencil = 0;
+        } else {
+            ca[n].clearValue.depthStencil.depth = (float)(zs >> 8) / 16777215.0f;
+            ca[n].clearValue.depthStencil.stencil = zs & 0xFF;
+        }
         n++;
     }
     if (!n)
@@ -1954,6 +2133,8 @@ static void dump_frame(VkImage img, uint32_t w, uint32_t h)
 static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         uint32_t aa_sx, uint32_t aa_sy)
 {
+    if (s_probe_armed == 1 || s_probe_armed == 3)
+        s_probe_armed++;                       /* 3 -> 4: the frame is done */
     Surface *s;
     VkCommandBuffer cmd;
     VkImageBlit b;
