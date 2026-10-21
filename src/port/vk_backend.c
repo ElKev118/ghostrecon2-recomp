@@ -94,10 +94,12 @@ typedef struct {
 typedef struct {
     uint64_t hash;
     uint32_t inputs;            /* v registers it reads */
+    uint32_t packed;            /* of those, 11:11:10 normals (uint input) */
+    uint32_t imm;               /* of those, constants (no vertex input) */
     VkShaderModule mod;
 } VshProg;
 #define VKB_MAX_VSH 256
-#define VSH_UBO_BYTES 3328u     /* 192 vec4 + 1, rounded to 256 */
+#define VSH_UBO_BYTES 3584u     /* 192 vec4 + aa + 16 imm, rounded to 256 */
 
 /* Set while draw_vertices draws a draw_vsh batch: untransformed inputs and an
  * index list, the program's module and constants. */
@@ -111,6 +113,8 @@ typedef struct {
     uint32_t nindices;
     const float (*constants)[4];
     float aa[2];
+    const Nv2aBatchVsh *b;      /* raw streams when b->raw */
+    uint64_t layout;            /* hash of the raw vertex layout */
 } VshDraw;
 static const VshDraw *s_vsh;
 
@@ -1272,6 +1276,42 @@ static int poly_offset_on(const Nv2aRenderState *rs, int has_depth)
         && (rs->poly_offset_factor != 0.0f || rs->poly_offset_bias != 0.0f);
 }
 
+/* The Vulkan vertex format reading an NV097 attribute as the CPU's fetch_attr
+ * does, or VK_FORMAT_UNDEFINED when there is none this device can fetch. */
+static VkFormat raw_format(uint32_t type, uint32_t size)
+{
+    static const VkFormat f2[4] = { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT,
+                                    VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT };
+    static const VkFormat f1[4] = { VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM,
+                                    VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM };
+    static const VkFormat f5[4] = { VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED,
+                                    VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16A16_SSCALED };
+    static const VkFormat f4[4] = { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM,
+                                    VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
+    static int8_t ok[8][5];                     /* 0 unknown, 1 yes, -1 no */
+    VkFormat f;
+
+    if (size < 1 || size > 4)
+        return VK_FORMAT_UNDEFINED;
+    switch (type) {
+    case 0: f = size == 4 ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED; break;
+    case 1: f = f1[size - 1]; break;
+    case 2: f = f2[size - 1]; break;
+    case 4: f = f4[size - 1]; break;
+    case 5: f = f5[size - 1]; break;
+    case 6: f = VK_FORMAT_R32_UINT; break;          /* decoded by the shader */
+    default: f = VK_FORMAT_UNDEFINED; break;
+    }
+    if (f == VK_FORMAT_UNDEFINED)
+        return f;
+    if (!ok[type][size]) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(B.c->phys, f, &fp);
+        ok[type][size] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : -1;
+    }
+    return ok[type][size] > 0 ? f : VK_FORMAT_UNDEFINED;
+}
+
 /* The fragment shader for a set-up: generated once, then cached. NULL
  * (use the uber-shader) when generation or compilation fails. */
 static VkShaderModule fs_get(const uint32_t *spec, int zofs)
@@ -1314,7 +1354,7 @@ static VkShaderModule fs_get(const uint32_t *spec, int zofs)
 
 static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
 {
-    uint64_t k0, k1, k2, k3 = s_vsh ? s_vsh->id : 0;
+    uint64_t k0, k1, k2, k3 = s_vsh ? (s_vsh->id | (s_vsh->layout << 16)) : 0;
     uint32_t hsh, specv[SPEC_N];
     VkSpecializationMapEntry sme[SPEC_N];
     VkSpecializationInfo spi;
@@ -1322,6 +1362,7 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo stages[2];
     VkVertexInputBindingDescription vb = { 0, sizeof(Nv2aVertexXf), VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputBindingDescription vbs[16];
     VkVertexInputAttributeDescription va[16];
     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
@@ -1409,7 +1450,25 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     vi.pVertexBindingDescriptions = &vb;
     vi.vertexAttributeDescriptionCount = 8;
     vi.pVertexAttributeDescriptions = va;
-    if (s_vsh) {
+    if (s_vsh && s_vsh->b && s_vsh->b->raw) {
+        /* The guest's own streams: one binding each, attributes decoded
+         * by the vertex input. */
+        const Nv2aBatchVsh *rb = s_vsh->b;
+        for (i = 0; i < (int)rb->nstreams; i++) {
+            vbs[i].binding = (uint32_t)i;
+            vbs[i].stride = rb->stream[i].stride;
+            vbs[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        }
+        for (i = 0; i < (int)rb->nattrs; i++) {
+            va[i].location = rb->attr[i].reg;
+            va[i].binding = rb->attr[i].stream;
+            va[i].format = raw_format(rb->attr[i].type, rb->attr[i].size);
+            va[i].offset = rb->attr[i].offset;
+        }
+        vi.vertexBindingDescriptionCount = rb->nstreams;
+        vi.pVertexBindingDescriptions = vbs;
+        vi.vertexAttributeDescriptionCount = rb->nattrs;
+    } else if (s_vsh) {
         /* The program's inputs, packed in register order. */
         vb.stride = s_vsh->ninputs * 16;
         for (i = 0; i < (int)s_vsh->ninputs; i++) {
@@ -1644,7 +1703,14 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     static const Nv2aVertexXf zero_v;
     uint32_t vbytes = s_vsh ? s_vsh->nverts * s_vsh->ninputs * 16u
                             : count * (uint32_t)sizeof(Nv2aVertexXf);
+    const Nv2aBatchVsh *rawb = (s_vsh && s_vsh->b && s_vsh->b->raw) ? s_vsh->b : NULL;
     uint32_t ibytes = s_vsh ? s_vsh->nindices * 4u : 0;
+    if (rawb) {
+        uint32_t k;
+        vbytes = 0;
+        for (k = 0; k < rawb->nstreams; k++)
+            vbytes += (rawb->stream[k].bytes + 255u) & ~255u;
+    }
     uint32_t bytes = ((vbytes + 255u) & ~255u) + ibytes;
     uint32_t ubytes = 512u + (s_vsh ? VSH_UBO_BYTES : 0u);
     int st;
@@ -1837,7 +1903,14 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         return;
 
     off = f->vused;
-    if (s_vsh) {
+    if (rawb) {
+        uint32_t k, at = 0;
+        for (k = 0; k < rawb->nstreams; k++) {
+            memcpy(f->vmap + f->vused + at, rawb->stream[k].data, rawb->stream[k].bytes);
+            at += (rawb->stream[k].bytes + 255u) & ~255u;
+        }
+        memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
+    } else if (s_vsh) {
         memcpy(f->vmap + f->vused, s_vsh->inputs, vbytes);
         memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
     } else {
@@ -1906,9 +1979,11 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         float aa[4] = { s_vsh->aa[0], s_vsh->aa[1], 0.0f, 0.0f };
         memcpy(f->umap + f->uused, s_vsh->constants, 192 * 16);
         memcpy(f->umap + f->uused + 192 * 16, aa, sizeof aa);
+        if (rawb)
+            memcpy(f->umap + f->uused + 192 * 16 + 16, rawb->imm, sizeof rawb->imm);
         vbi.buffer = f->ubuf;
         vbi.offset = f->uused;
-        vbi.range = 192 * 16 + 16;
+        vbi.range = 192 * 16 + 16 + 256;
         f->uused += VSH_UBO_BYTES;
     }
 
@@ -2001,7 +2076,20 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         vkCmdSetBlendConstants(cmd, bc);
     }
     vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, rs->stencil_ref & 0xFF);
-    vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
+    if (rawb) {
+        VkBuffer bufs[16];
+        VkDeviceSize offs[16];
+        uint32_t k, at = 0;
+        for (k = 0; k < rawb->nstreams; k++) {
+            bufs[k] = f->vbuf;
+            offs[k] = off + at;
+            at += (rawb->stream[k].bytes + 255u) & ~255u;
+        }
+        if (rawb->nstreams)
+            vkCmdBindVertexBuffers(cmd, 0, rawb->nstreams, bufs, offs);
+    } else {
+        vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
+    }
     s_stat_draws++;
     if (s_vsh) {
         vkCmdBindIndexBuffer(cmd, f->vbuf, off + ((vbytes + 255u) & ~255u), VK_INDEX_TYPE_UINT32);
@@ -2773,7 +2861,7 @@ static void vkb_flip(void)
 
 static const char *VSH_OUTPUTS =
     "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
-    "layout(std140, set = 0, binding = 2) uniform VSHC { vec4 cst[192]; vec4 vaa; };\n"
+    "layout(std140, set = 0, binding = 2) uniform VSHC { vec4 cst[192]; vec4 vaa; vec4 vimm[16]; };\n"
     "layout(location=0) out vec4 vD0;\n"
     "layout(location=1) out vec4 vD1;\n"
     "layout(location=2) out vec4 vFog;\n"
@@ -2799,7 +2887,7 @@ static const char *VSH_EPILOGUE =
 /* The compiled program for this batch, from the cache or built now. */
 static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
 {
-    uint32_t mask = 0, k;
+    uint32_t mask = 0, k, packed = 0, imm = 0;
     size_t cap = 512u << 10, n;
     char *src, *body;
     VshProg *p;
@@ -2807,8 +2895,15 @@ static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
 
     for (k = 0; k < b->ninputs; k++)
         mask |= 1u << b->input_reg[k];
+    if (b->raw) {
+        imm = b->imm_mask & mask;
+        for (k = 0; k < b->nattrs; k++)
+            if (b->attr[k].type == 6)
+                packed |= 1u << b->attr[k].reg;
+    }
     for (i = 0; i < B.nvsh; i++)
-        if (B.vsh[i].hash == b->program_hash && B.vsh[i].inputs == mask) {
+        if (B.vsh[i].hash == b->program_hash && B.vsh[i].inputs == mask
+            && B.vsh[i].packed == packed && B.vsh[i].imm == imm) {
             *id = (uint32_t)i + 1;
             return B.vsh[i].mod ? &B.vsh[i] : NULL;
         }
@@ -2818,6 +2913,8 @@ static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
     memset(p, 0, sizeof *p);
     p->hash = b->program_hash;
     p->inputs = mask;
+    p->packed = packed;
+    p->imm = imm;
     *id = (uint32_t)B.nvsh + 1;
     B.nvsh++;                    /* a failed compile stays cached as NULL */
     src = (char *)malloc(cap);
@@ -2834,15 +2931,27 @@ static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
     }
     n = (size_t)snprintf(src, cap, "#version 450\n");
     for (k = 0; k < 16; k++)
-        if (mask & (1u << k))
-            n += (size_t)snprintf(src + n, cap - n, "layout(location=%u) in vec4 in_%u;\n", k, k);
+        if ((mask & (1u << k)) && !(imm & (1u << k)))
+            n += (size_t)snprintf(src + n, cap - n, "layout(location=%u) in %s in_%u;\n",
+                                  k, (packed & (1u << k)) ? "uint" : "vec4", k);
     n += (size_t)snprintf(src + n, cap - n, "%s%s", VSH_OUTPUTS, nv2a_vsh_glsl_prelude());
     n += (size_t)snprintf(src + n, cap - n,
                           "void main() {\n  vec4 v[16];\n"
                           "  for (int k = 0; k < 16; k++) v[k] = vec4(0.0, 0.0, 0.0, 1.0);\n");
-    for (k = 0; k < 16; k++)
-        if (mask & (1u << k))
+    for (k = 0; k < 16; k++) {
+        if (!(mask & (1u << k)))
+            continue;
+        if (imm & (1u << k))
+            n += (size_t)snprintf(src + n, cap - n, "  v[%u] = vimm[%u];\n", k, k);
+        else if (packed & (1u << k))
+            /* 11:11:10 signed normal, as fetch_attr decodes it. */
+            n += (size_t)snprintf(src + n, cap - n,
+                                  "  v[%u] = vec4(float(int(in_%u << 21u) >> 21) / 1023.0,"
+                                  " float(int(in_%u << 10u) >> 21) / 1023.0,"
+                                  " float(int(in_%u) >> 22) / 511.0, 1.0);\n", k, k, k, k);
+        else
             n += (size_t)snprintf(src + n, cap - n, "  v[%u] = in_%u;\n", k, k);
+    }
     n += (size_t)snprintf(src + n, cap - n, "%s%s}\n", body, VSH_EPILOGUE);
     if (n >= cap) {
         free(src); free(body);
@@ -2875,6 +2984,12 @@ static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
         return 0;
     if (b->ninputs > 16 || !b->nindices)
         return 0;
+    if (b->raw) {
+        uint32_t k;
+        for (k = 0; k < b->nattrs; k++)
+            if (raw_format(b->attr[k].type, b->attr[k].size) == VK_FORMAT_UNDEFINED)
+                return 0;                      /* the CPU fetches this one */
+    }
     p = vsh_get(b, &id);
     if (!p)
         return 0;                              /* the CPU path draws it */
@@ -2890,6 +3005,19 @@ static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
     d.constants = b->constants;
     d.aa[0] = b->aa_sx;
     d.aa[1] = b->aa_sy;
+    d.b = b;
+    if (b->raw) {
+        uint64_t h = 1469598103934665603ull;
+        uint32_t k;
+        for (k = 0; k < b->nstreams; k++)
+            h = (h ^ b->stream[k].stride) * 1099511628211ull;
+        for (k = 0; k < b->nattrs; k++)
+            h = (h ^ ((uint64_t)b->attr[k].reg | (uint64_t)b->attr[k].stream << 8
+                      | (uint64_t)b->attr[k].type << 16 | (uint64_t)b->attr[k].size << 24
+                      | (uint64_t)b->attr[k].offset << 32)) * 1099511628211ull;
+        d.layout = (h ^ (h >> 40)) & 0xFFFFFFFFFFull;
+        if (!d.layout) d.layout = 1;
+    }
     x.vertices = NULL;
     x.count = b->nindices;
     x.state = b->state;
