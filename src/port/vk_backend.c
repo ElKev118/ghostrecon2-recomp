@@ -352,7 +352,7 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
     }
     s = &B.surf[slot];
     if (!make_image(w, h, depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
-                    depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                    depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
                           : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
                     depth, &s->img, &s->mem, &s->view))
@@ -564,6 +564,14 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
  * draws its 256x256 grade table into an address it also uses as a 640x480
  * buffer), so coordinates must be scaled to the part that holds the data. */
 static uint32_t s_view_w, s_view_h;
+/* texture_view found a depth texture: a shadow-map stage (compare, not colour). */
+static int s_view_depth;
+
+static int is_depth_format(uint32_t c)
+{
+    return c == 0x2A || c == 0x2B || c == 0x2C || c == 0x2D
+        || c == 0x2E || c == 0x2F || c == 0x30 || c == 0x31;
+}
 
 static VkImageView texture_view(const Nv2aTexStage *st)
 {
@@ -577,6 +585,17 @@ static VkImageView texture_view(const Nv2aTexStage *st)
     if (!st->enabled || !src->width || !src->height
         || src->width > 4096 || src->height > 4096)
         return NULL;
+    if (is_depth_format(src->color)) {
+        /* A depth texture is a depth surface we rendered: sample its depth
+         * aspect and let the shader compare (shadow map). */
+        Surface *dz = find_surface_w(src->offset, 1, 0);
+        if (!dz || dz == B.rt_depth)
+            return NULL;
+        to_layout(dz, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        s_view_w = dz->w; s_view_h = dz->h;
+        s_view_depth = 1;
+        return dz->view;
+    }
     /* Rendered by us: sample the surface itself. */
     s = find_surface_for_tex(src->offset, src->width);
     if (s && src->width == 256 && (src->offset & 0x0FFFFFFFu) == 0x00A17000u) {
@@ -749,6 +768,8 @@ typedef struct {
     uint32_t misc[4];       /* clip_plane_mode, fog_enable, fog_color, fog_mode */
     float    fogp[4];       /* fog bias, fog scale */
     float    clampmin[2][4];/* half a texel of the image, per stage (see clampmax) */
+    uint32_t shadow[4];     /* x: stage mask of shadow-map stages, y: compare func */
+    float    shadowmax[4];  /* per stage: largest depth value of its format */
 } RcUbo;
 
 static const char *VS_SRC =
@@ -787,7 +808,7 @@ static const char *FS_SRC =
     "layout(set=0, binding=0) uniform sampler2D tex[4];\n"
     "layout(std140, set=0, binding=1) uniform RC {\n"
     "  uvec4 cicw[2]; uvec4 aicw[2]; uvec4 cocw[2]; uvec4 aocw[2]; uvec4 f0[2]; uvec4 f1[2];\n"
-    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; } rc;\n"
+    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; uvec4 shadow; vec4 shadowmax; } rc;\n"
     "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 outColor;\n"
     /* A port of the executor's own CPU combiner (nv2a_combiner.c) and
@@ -856,6 +877,16 @@ static const char *FS_SRC =
     "      uint mode = (sp >> uint(st * 5)) & 31u;\n"
     "      vec4 tc = vT[st]; float q = tc.w != 0.0 ? tc.w : 1.0;\n"
     "      if (mode == 0u) t[st] = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "      else if ((mode == 1u || mode == 2u) && ((rc.shadow.x >> uint(st)) & 1u) != 0u) {\n"
+    /* Shadow map (xemu psh_append_shadowmap): stored depth <func> z/w. */
+    "        float d = samp(st, tc.xy / q * pc.texscale[st].xy).r * rc.shadowmax[st];\n"
+    "        float z = clamp(tc.z / q, 0.0, rc.shadowmax[st]);\n"
+    "        bool r; uint f = rc.shadow.y;\n"
+    "        if (f == 0u) r = false; else if (f == 1u) r = d < z; else if (f == 2u) r = d == z;\n"
+    "        else if (f == 3u) r = d <= z; else if (f == 4u) r = d > z; else if (f == 5u) r = d != z;\n"
+    "        else if (f == 6u) r = d >= z; else r = true;\n"
+    "        t[st] = vec4(r ? 1.0 : 0.0);\n"
+    "      }\n"
     "      else if (mode == 1u || mode == 2u || mode == 3u)\n"
     "        t[st] = samp(st, tc.xy / q * pc.texscale[st].xy);\n"
     "      else if (mode == 4u) t[st] = clamp(tc, 0.0, 1.0);\n"
@@ -1232,6 +1263,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
 {
     RcUbo ubo;
     float cmin[4][2];
+    uint32_t shadow_mask = 0;
+    float shadow_max[4] = { 1, 1, 1, 1 };
     VkDescriptorBufferInfo ubi;
     VkWriteDescriptorSet w2[2];
     Frame *f;
@@ -1259,13 +1292,40 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     memset(&pc, 0, sizeof pc);
     memset(cmin, 0, sizeof cmin);
     /* Textures first: sampling a surface may end the current rendering. */
+    {
+        /* RECOMP_VK_PREGRADE=n: dump every surface right before the n-th
+         * and (n+1)-th colour-grade pass (stage 1 DEPENDENT_AR). */
+        static int want = -2, seen;
+        if (want == -2) {
+            const char *e = getenv("RECOMP_VK_PREGRADE");
+            want = e ? atoi(e) : -1;
+        }
+        if (want > 0 && px && ((px->stage_program >> 5) & 31) == 15) {
+            seen++;
+            if (seen == want || seen == want + 1) {
+                end_rendering();
+                dump_surfaces(seen == want ? "pg0_" : "pg1_", 0);
+                begin_frame();                 /* the dump submitted ours */
+                B.rt_color = NULL;
+                fprintf(stderr, "[VKB] pre-grade dump %d, grade target %08X reads %08X\n",
+                        seen, sf->color_va, stages ? stages[0].t.offset : 0);
+            }
+        }
+    }
     B.next_target = va_key(sf->color_va);
     B.next_target_w = sf->pitch / (sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
     if (B.next_target_w < sf->width) B.next_target_w = sf->width;
     for (st = 0; st < 4; st++) {
         VkImageView view;
         s_view_w = s_view_h = 0;
+        s_view_depth = 0;
         view = stages ? texture_view(&stages[st]) : NULL;
+        if (view && s_view_depth) {
+            shadow_mask |= 1u << st;
+            shadow_max[st] = (stages[st].t.color == 0x2C || stages[st].t.color == 0x2D
+                              || stages[st].t.color == 0x30 || stages[st].t.color == 0x31)
+                           ? 65535.0f : 16777215.0f;
+        }
         ii[st].sampler = stages ? get_sampler(&stages[st]) : B.samplers[0];
         ii[st].imageView = view ? view : B.white_view;
         ii[st].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1375,6 +1435,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             ubo.clampmin[k >> 1][(k & 1) * 2 + 1] = cmin[k][1];
         }
     }
+    ubo.shadow[0] = shadow_mask;
+    ubo.shadow[1] = px ? px->shadow_func : 0;
+    memcpy(ubo.shadowmax, shadow_max, sizeof shadow_max);
     memcpy(f->umap + f->uused, &ubo, sizeof ubo);
     ubi.buffer = f->ubuf;
     ubi.offset = f->uused;
