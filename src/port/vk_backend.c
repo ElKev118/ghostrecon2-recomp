@@ -602,6 +602,21 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
         return 0;
     argb = (uint32_t *)map;
     s_stat_uploads++;
+    {
+        /* RECOMP_VK_UPLOAD_LOG=n: log uploads after the first n seconds. */
+        static int after = -2;
+        static uint32_t t0;
+        static unsigned said;
+        if (after == -2) {
+            const char *e = getenv("RECOMP_VK_UPLOAD_LOG");
+            after = e ? atoi(e) : -1;
+            t0 = GetTickCount();
+        }
+        if (after >= 0 && GetTickCount() - t0 > (uint32_t)after * 1000u && said++ < 60)
+            fprintf(stderr, "[VKB] upload %08X %ux%u fmt %02X pitch %u levels %u (frame %u)\n",
+                    src->offset, src->width, src->height, src->color, src->pitch,
+                    src->levels, B.frame_no);
+    }
     if (!nv2a_backend_decode_texture(src, argb))
         memset(argb, 0xFF, bytes);             /* unsupported: white, as the CPU path */
     {

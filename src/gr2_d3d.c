@@ -22,6 +22,7 @@
 #include "gen/recomp_funcs.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <windows.h>
 
 #define GR2_D3D_DEVICE_PTR   0x0043A1B8u
@@ -47,6 +48,28 @@ void sub_0042F970(void)
 
     if (!dev) {
         esp += 12; return;
+    }
+
+    {
+        /* The title's frame limiter (0x0007E19D): when the frame took less
+         * than *(float *)0x57BF1C ms it sleeps the rest. RECOMP_GR2_FRAME_MS
+         * overrides that target (0 = no limit); logged when it changes. */
+        static float last = -1.0f;
+        static int ovr = -2;
+        static float want;
+        float cur = MEMF(0x57BF1C);
+        if (ovr == -2) {
+            const char *e = getenv("RECOMP_GR2_FRAME_MS");
+            ovr = e != NULL;
+            want = e ? (float)atof(e) : 0.0f;
+        }
+        if (ovr && cur != want && cur > 0.0f)
+            MEMF(0x57BF1C) = want;
+        if (cur != last) {
+            fprintf(stderr, "  [GR2] frame limiter target %.3f ms%s\n", cur,
+                    ovr ? " (overridden)" : "");
+            last = cur;
+        }
     }
 
     /* Hand the executor the semaphore once; re-check in case D3D moved it

@@ -521,7 +521,11 @@ static void on_flip(const uint32_t *xrgb, uint32_t w, uint32_t h)
     if (s_pending) {
         memcpy(s_pending, xrgb, (size_t)w * h * 4);
         s_have_frame = 1;
-        s_flips++;
+        /* With the Vulkan renderer every flip also arrives as
+         * vkw_set_gpu_frame, which counts it: counting here too showed
+         * twice the real frame rate in the title. */
+        if (!s_gpu_img)
+            s_flips++;
     }
     SDL_UnlockMutex(s_lock);
 }
