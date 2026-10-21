@@ -107,3 +107,28 @@ Observado por el usuario en `run_gr2_vulkan.bat` (commit 77b5b81):
 - **Descartado (2026-10-20)**: sincronización. `RECOMP_VK_SYNC_EACH=1` (barrera completa + reinicio de rendering por draw) y `=2` (además submit + wait) siguen mostrando cian (confirmado por el usuario: base lejana, muro/montaña). El suelo bien visto durante la sonda era otra vista, no un arreglo.
 - Evaluación a mano del pase de detalle `306/300` (5 etapas): resultado ≈ 0.5 gris → no oscurece en teoría. El oscurecimiento viene de otro pase; candidatos sin evaluar: `306/0` (`prog 00421`, 3 etapas; `prog 00001` 1 etapa, 60 draws) y pases con modos no implementados (BUMPENV 6/7, DOT 9/12/17) que el shader devuelve como 0.
 - Sugerencia de método para la próxima sesión: comparar con una captura de xemu en el mismo sitio (el usuario tiene xemu) y usar `RECOMP_VK_SKIP_BLEND` por clases de pase midiendo con la misma vista fija.
+
+## Ground darkness: solved (2026-10-21)
+
+The cyan / black ground and the dark shadows were four separate bugs, each
+found with the non-stalling probe (RECOMP_VK_PROBE=x,y;x,y..., probe.flag,
+per-draw 32x32 copies, one whole frame) and combiner dumps
+(RECOMP_VK_RC_DUMP=<prog> [_W=<width>] [_T0=<tex va>]):
+
+1. Sub-pixel snap. The colour-grade table is drawn from 0.53125 (D3D's screen
+   offset); without xemu's 1/16 truncation row and column 0 stayed black, and
+   grade lookups with scene alpha 0 lost red -> cyan.
+2. Z16 depth clears. The clear value was always read as Z24S8; the shadow
+   maps (Z16) were cleared to ~0, so uncovered texels compared as shadowed
+   (dark patch on tree trunks).
+3. Polygon offset (SET_POLY_OFFSET_FILL_ENABLE + factor/bias) for the
+   shadow-map renders, in a ZOFS shader variant that writes gl_FragDepth.
+4. Border colour. The ground detail decals (Y8 8267C000, modulate2x 306/300,
+   5 combiner stages) use address mode 4 (BORDER) with BORDER_SOURCE = colour
+   and SET_TEXTURE_BORDER_COLOR = FF7F7F7F (neutral). We sampled transparent
+   black outside [0,1], so every detail pass multiplied the ground by ~0.27
+   (base entrance pitch black, mid-distance dark, a visible seam at the decal
+   edge). The shader now returns the border colour per stage/axis.
+
+Debug knobs added: RECOMP_VK_FS=fog|nofog|stN|dtex0|dd0 (st*/dtex0/dd0 only
+on the modulate passes), RECOMP_VK_SHADOW=0|1.

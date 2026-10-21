@@ -567,10 +567,14 @@ static uint32_t s_view_w, s_view_h;
 /* RECOMP_VK_PROBE: 1 = flag file seen, 2 = a present happened since,
  * 3 = probing, 4 = the probed frame was presented. */
 static int s_probe_armed;
-#define PROBE_MAX 4000
+#define PROBE_MAX 3000
 #define PROBE_R   32
+#define PROBE_PTS 6
 typedef struct {
     uint32_t ok, surf, count, blend, bsrc, bdst, cmask, sp, ctl, f0, f1, t0, t0f, t1, t1f;
+    /* Enough to evaluate the draw's combiners by hand. */
+    uint32_t seen, cicw[8], aicw[8], cocw[8], aocw[8], k0[8], k1[8];
+    float d0[4], tc0[4];
 } ProbeRec;
 static ProbeRec s_probe_rec[PROBE_MAX];
 static VkBuffer s_probe_buf;
@@ -782,6 +786,8 @@ typedef struct {
     float    clampmin[2][4];/* half a texel of the image, per stage (see clampmax) */
     uint32_t shadow[4];     /* x: stage mask of shadow-map stages, y: compare func */
     float    shadowmax[4];  /* per stage: largest depth value of its format */
+    uint32_t border[4];     /* per stage: SET_TEXTURE_BORDER_COLOR (ARGB) */
+    uint32_t bmask[4];      /* x: bit 2*st u, 2*st+1 v use the border colour */
 } RcUbo;
 
 static const char *VS_SRC =
@@ -827,7 +833,8 @@ static const char *FS_SRC =
     "layout(set=0, binding=0) uniform sampler2D tex[4];\n"
     "layout(std140, set=0, binding=1) uniform RC {\n"
     "  uvec4 cicw[2]; uvec4 aicw[2]; uvec4 cocw[2]; uvec4 aocw[2]; uvec4 f0[2]; uvec4 f1[2];\n"
-    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; uvec4 shadow; vec4 shadowmax; } rc;\n"
+    "  uvec4 fin; uvec4 ctl; uvec4 misc; vec4 fogp; vec4 clampmin[2]; uvec4 shadow; vec4 shadowmax;\n"
+    "  uvec4 border; uvec4 bmask; } rc;\n"
     "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
     "layout(location=0) out vec4 outColor;\n"
     /* A port of the executor's own CPU combiner (nv2a_combiner.c) and
@@ -857,6 +864,14 @@ static const char *FS_SRC =
     "vec4 samp(int st, vec2 uv) {\n"
     "  vec4 cm = pc.clampmax[st >> 1]; vec2 mx = (st & 1) == 0 ? cm.xy : cm.zw;\n"
     "  vec4 cn = rc.clampmin[st >> 1]; vec2 mn = (st & 1) == 0 ? cn.xy : cn.zw;\n"
+    /* BORDER addressing with the border colour register: outside [0,1] the
+     * stage reads that colour (Ghost Recon 2's ground detail decals use a
+     * neutral grey there; a black border blackened the ground). */
+    "  uint bm = (rc.bmask.x >> uint(st * 2)) & 3u;\n"
+    "  if (bm != 0u && mx.x <= 0.0\n"
+    "      && (((bm & 1u) != 0u && (uv.x < 0.0 || uv.x > 1.0))\n"
+    "          || ((bm & 2u) != 0u && (uv.y < 0.0 || uv.y > 1.0))))\n"
+    "    return unpk(rc.border[st]);\n"
     "  if (mx.x > 0.0) uv = clamp(uv, mn, mx);\n"
     "  if (st == 0) return texture(tex[0], uv);\n"
     "  if (st == 1) return texture(tex[1], uv);\n"
@@ -934,6 +949,8 @@ static const char *FS_SRC =
     "    R[3] = vec4(unpk(rc.misc.z).rgb, fog_factor(vFog.x));\n"
     "    R[4] = vD0; R[5] = vD1;\n"
     "    R[8] = t[0]; R[9] = t[1]; R[10] = t[2]; R[11] = t[3];\n"
+    "    if (pc.alpha.w == 20) { outColor = vec4(t[0].rgb, 1.0); return; }\n"
+    "    if (pc.alpha.w == 21) { outColor = vec4(clamp(vD0.rgb, 0.0, 1.0), clamp(vD0.a, 0.0, 1.0)); return; }\n"
     "    R[12].a = (sp & 31u) != 0u ? t[0].a : 1.0;\n"
     "    uint n = min(rc.ctl.x & 255u, 8u), flags = rc.ctl.x >> 8;\n"
     "    for (uint s = 0u; s < n; s++) {\n"
@@ -967,6 +984,9 @@ static const char *FS_SRC =
     "      d = aocw & 15u;        if (d != 0u) R[d].a = acd;\n"
     "      d = (aocw >> 8) & 15u; if (d != 0u) R[d].a = ams;\n"
     "      R[0] = vec4(0.0);\n"
+    /* RECOMP_VK_FS=stN: r0 after stage N (on the passes C chose). */
+    "      if (pc.alpha.w >= 10 && pc.alpha.w < 20 && int(s) == pc.alpha.w - 10) {\n"
+    "        outColor = vec4(clamp(R[12].rgb, 0.0, 1.0), clamp(R[12].a, 0.0, 1.0)); return; }\n"
     "    }\n"
     "    if (rc.fin.x != 0u || rc.fin.y != 0u) {\n"
     "      uint f0 = rc.fin.x, f1 = rc.fin.y, ff = f1 & 255u;\n"
@@ -1486,6 +1506,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     memset(&ubo, 0, sizeof ubo);
     uint32_t px_state_sp = px ? px->stage_program : 0, px_state_ctl = px ? px->control : 0;
     uint32_t px_state_f0 = px ? px->final0 : 0, px_state_f1 = px ? px->final1 : 0;
+    const Nv2aPixelState *px_state = px;     /* the probe block shadows px */
     uint32_t px_state_seen = px ? px->rc_seen : 0;
     if (px) {
         memcpy(ubo.cicw, px->color_icw, 32);
@@ -1509,6 +1530,15 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         for (k = 0; k < 4; k++) {
             ubo.clampmin[k >> 1][(k & 1) * 2 + 0] = cmin[k][0];
             ubo.clampmin[k >> 1][(k & 1) * 2 + 1] = cmin[k][1];
+        }
+        /* Border colour: address mode 4 with the format word's BORDER_SOURCE
+         * bit (3) set to "colour" (else the texels carry the border). */
+        for (k = 0; stages && k < 4; k++) {
+            if (!stages[k].enabled || !(stages[k].format_word & 0x8u))
+                continue;
+            if ((stages[k].t.addr_u & 7) == 4) ubo.bmask[0] |= 1u << (k * 2);
+            if ((stages[k].t.addr_v & 7) == 4) ubo.bmask[0] |= 2u << (k * 2);
+            ubo.border[k] = stages[k].border_color;
         }
     }
     ubo.shadow[0] = shadow_mask;
@@ -1547,11 +1577,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             dbg = !e ? 0 : !strcmp(e, "magenta") ? 1 : !strcmp(e, "d0") ? 2
                 : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4
                 : !strcmp(e, "gradeAR") ? 5 : !strcmp(e, "gradeT0") ? 6
-                : !strcmp(e, "fog") ? 7 : !strcmp(e, "nofog") ? 8 : 0;
+                : !strcmp(e, "fog") ? 7 : !strcmp(e, "nofog") ? 8
+                : !strncmp(e, "st", 2) ? 10 + atoi(e + 2)
+                : !strcmp(e, "dtex0") ? 20 : !strcmp(e, "dd0") ? 21 : 0;
         }
         /* Not on full-screen quads: the post-process passes would paint
          * the debug output over the whole scene. */
         pc.alpha[3] = (dbg >= 2 && dbg != 5 && dbg != 6 && count <= 6) ? 0 : dbg;
+        /* st*, dtex0, dd0: only on the modulate (DST_COLOR/SRC_COLOR) passes,
+         * whose output the probe can turn back into the shader's: out =
+         * 2 * src * dst. */
+        if (dbg >= 10 && !(rs->blend_enable && rs->blend_src == 0x306))
+            pc.alpha[3] = 0;
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -1615,11 +1652,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         /* RECOMP_VK_PROBE=x,y (+ flag file probe.flag): for one frame, read
          * pixel (x,y) of the colour target after every draw and log it with
          * the draw's state -- which draw turns a pixel wrong. */
-        static int px = -2, py, active, done, idx;
+        /* RECOMP_VK_PROBE=x,y[;x,y...]: up to PROBE_PTS points at once. */
+        static int px = -2, py, active, done, idx, npts;
+        static int ptx[PROBE_PTS], pty[PROBE_PTS];
         if (px == -2) {
             const char *e = getenv("RECOMP_VK_PROBE");
             px = -1;
-            if (e) sscanf(e, "%d,%d", &px, &py);
+            while (e && npts < PROBE_PTS && sscanf(e, "%d,%d", &ptx[npts], &pty[npts]) == 2) {
+                npts++;
+                e = strchr(e, ';');
+                if (e) e++;
+            }
+            if (npts) { px = ptx[0]; py = pty[0]; }
         }
         if (px >= 0 && !done) {
             /* Start at a frame boundary (the next present), so the log
@@ -1639,34 +1683,45 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 Surface *t = B.rt_color;
                 ProbeRec *r = &s_probe_rec[idx];
                 VkBufferImageCopy c;
-                int x0 = px - PROBE_R / 2, y0 = py - PROBE_R / 2;
-                if (!s_probe_buf && !make_buffer((VkDeviceSize)PROBE_MAX * PROBE_R * PROBE_R * 4,
+                int p;
+                if (!s_probe_buf && !make_buffer((VkDeviceSize)PROBE_MAX * PROBE_PTS * PROBE_R * PROBE_R * 4,
                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                                  &s_probe_buf, &s_probe_mem, (void **)&s_probe_map))
                     done = 1;
                 if (!done) {
-                    if (x0 < 0) x0 = 0;
-                    if (y0 < 0) y0 = 0;
-                    if (x0 + PROBE_R > (int)t->w) x0 = (int)t->w - PROBE_R;
-                    if (y0 + PROBE_R > (int)t->h) y0 = (int)t->h - PROBE_R;
-                    r->ok = x0 >= 0 && y0 >= 0;
+                    r->ok = t->w >= PROBE_R && t->h >= PROBE_R;
                     r->surf = t->va; r->count = count;
                     r->blend = rs->blend_enable; r->bsrc = rs->blend_src; r->bdst = rs->blend_dst;
                     r->cmask = rs->color_mask;
                     r->sp = px_state_sp; r->ctl = px_state_ctl; r->f0 = px_state_f0; r->f1 = px_state_f1;
+                    r->seen = px_state_seen;
+                    if (px_state) {
+                        memcpy(r->cicw, px_state->color_icw, 32); memcpy(r->aicw, px_state->alpha_icw, 32);
+                        memcpy(r->cocw, px_state->color_ocw, 32); memcpy(r->aocw, px_state->alpha_ocw, 32);
+                        memcpy(r->k0, px_state->factor0, 32); memcpy(r->k1, px_state->factor1, 32);
+                    }
+                    memcpy(r->d0, v[0].d0, sizeof r->d0);
+                    memcpy(r->tc0, v[0].tex[0], sizeof r->tc0);
                     r->t0 = stages ? stages[0].t.offset : 0; r->t0f = stages ? stages[0].t.color : 0;
                     r->t1 = stages ? stages[1].t.offset : 0; r->t1f = stages ? stages[1].t.color : 0;
                     if (r->ok) {
                         to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        memset(&c, 0, sizeof c);
-                        c.bufferOffset = (VkDeviceSize)idx * PROBE_R * PROBE_R * 4;
-                        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                        c.imageSubresource.layerCount = 1;
-                        c.imageOffset.x = x0; c.imageOffset.y = y0;
-                        c.imageExtent.width = PROBE_R; c.imageExtent.height = PROBE_R;
-                        c.imageExtent.depth = 1;
-                        vkCmdCopyImageToBuffer(cur()->cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                               s_probe_buf, 1, &c);
+                        for (p = 0; p < npts; p++) {
+                            int x0 = ptx[p] - PROBE_R / 2, y0 = pty[p] - PROBE_R / 2;
+                            if (x0 < 0) x0 = 0;
+                            if (y0 < 0) y0 = 0;
+                            if (x0 + PROBE_R > (int)t->w) x0 = (int)t->w - PROBE_R;
+                            if (y0 + PROBE_R > (int)t->h) y0 = (int)t->h - PROBE_R;
+                            memset(&c, 0, sizeof c);
+                            c.bufferOffset = ((VkDeviceSize)idx * PROBE_PTS + p) * PROBE_R * PROBE_R * 4;
+                            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                            c.imageSubresource.layerCount = 1;
+                            c.imageOffset.x = x0; c.imageOffset.y = y0;
+                            c.imageExtent.width = PROBE_R; c.imageExtent.height = PROBE_R;
+                            c.imageExtent.depth = 1;
+                            vkCmdCopyImageToBuffer(cur()->cmd, t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                   s_probe_buf, 1, &c);
+                        }
                         B.rt_color = NULL;
                     }
                     idx++;
@@ -1684,9 +1739,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             begin_frame();
             B.rt_color = NULL;
             fprintf(stderr, "[PROBE] done after %d draws\n", idx);
-            for (i = 0; i < idx; i++) {
-                const ProbeRec *r = &s_probe_rec[i];
-                const uint8_t *m = s_probe_map + (size_t)i * PROBE_R * PROBE_R * 4;
+            for (i = 0; i < idx * npts; i++) {
+                const ProbeRec *r = &s_probe_rec[i / npts];
+                const uint8_t *m = s_probe_map + ((size_t)(i / npts) * PROBE_PTS + i % npts) * PROBE_R * PROBE_R * 4;
                 const uint8_t *ce = m + ((PROBE_R / 2) * PROBE_R + PROBE_R / 2) * 4;
                 unsigned cyan = 0, dark = 0, k, sum = 0;
                 if (!r->ok) continue;
@@ -1696,11 +1751,25 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     if (rr + gg + bb < 24) dark++;
                     else if (gg + bb > 60 && 2 * rr < gg && 2 * rr < bb) cyan++;
                 }
-                fprintf(stderr, "[PROBE] #%d surf %08X n %u | RGBA %3u %3u %3u %3u | sq dark %u cyan %u avg %u"
+                fprintf(stderr, "[PROBE] #%d p%d (%d,%d) surf %08X n %u | RGBA %3u %3u %3u %3u | sq dark %u cyan %u avg %u"
                         " | blend %u %X/%X cmask %08X | prog %05X ctl %08X fin %08X %08X | t0 %08X fmt %02X t1 %08X fmt %02X\n",
-                        i, r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
+                        i / npts, i % npts, ptx[i % npts], pty[i % npts], r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
                         sum / (PROBE_R * PROBE_R * 3), r->blend, r->bsrc, r->bdst, r->cmask,
                         r->sp, r->ctl, r->f0, r->f1, r->t0, r->t0f, r->t1, r->t1f);
+            }
+            /* Full combiner state of the modulate passes (DST_COLOR/SRC_COLOR),
+             * with vertex 0's colour and texture coordinate. */
+            for (i = 0; i < idx; i++) {
+                const ProbeRec *r = &s_probe_rec[i];
+                int s;
+                if (!(r->blend && r->bsrc == 0x306))
+                    continue;
+                fprintf(stderr, "[PROBE] rc #%d seen %u ctl %08X d0 %.3f %.3f %.3f %.3f tc0 %.3f %.3f %.3f %.3f\n",
+                        i, r->seen, r->ctl, r->d0[0], r->d0[1], r->d0[2], r->d0[3],
+                        r->tc0[0], r->tc0[1], r->tc0[2], r->tc0[3]);
+                for (s = 0; s < (int)(r->ctl & 7); s++)
+                    fprintf(stderr, "[PROBE] rc #%d  %d: cI %08X aI %08X cO %08X aO %08X f0 %08X f1 %08X\n",
+                            i, s, r->cicw[s], r->aicw[s], r->cocw[s], r->aocw[s], r->k0[s], r->k1[s]);
             }
             fflush(stderr);
             dump_surfaces("pr_", 0);
@@ -1763,6 +1832,10 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
                 fprintf(stderr, "[RC]  %d: cI %08X aI %08X cO %08X aO %08X f0 %08X f1 %08X\n", i,
                         p->color_icw[i], p->alpha_icw[i], p->color_ocw[i], p->alpha_ocw[i],
                         p->factor0[i], p->factor1[i]);
+            fprintf(stderr, "[RC]  stage0 tex %08X %ux%u fmt %02X levels %u addr %u/%u filter %08X norm %u en %u fmtword %08X ctl0 %08X border %08X\n",
+                    p->stage[0].t.offset, p->stage[0].t.width, p->stage[0].t.height, p->stage[0].t.color,
+                    p->stage[0].t.levels, p->stage[0].t.addr_u, p->stage[0].t.addr_v, p->stage[0].t.filter,
+                    p->stage[0].normalised, p->stage[0].enabled, p->stage[0].format_word, p->stage[0].control0, p->stage[0].border_color);
             fprintf(stderr, "[RC]  target %08X %ux%u pitch %u, %u verts, zeta %08X fmt %u\n",
                     sf->color_va, sf->width, sf->height, sf->pitch, b->count,
                     b->state->zeta_va, p->zeta_format);
