@@ -1780,12 +1780,12 @@ static void dump_surfaces(const char *prefix, unsigned shot)
                                buf, 1, &c);
         submit_frame();
         vkDeviceWaitIdle(B.dev);
-        snprintf(path, sizeof path, "%s%04u_%08X.bmp", prefix, shot, sf->va);
+        snprintf(path, sizeof path, "%s%04u_%08X_w%u.bmp", prefix, shot, sf->va, sf->w);
         write_bmp(path, map, sf->w, sf->h);
         n = (size_t)sf->w * sf->h;
         for (k = 0; k < n; k++)
             map[k * 4] = map[k * 4 + 1] = map[k * 4 + 2] = map[k * 4 + 3];
-        snprintf(path, sizeof path, "%s%04u_%08X_a.bmp", prefix, shot, sf->va);
+        snprintf(path, sizeof path, "%s%04u_%08X_w%u_a.bmp", prefix, shot, sf->va, sf->w);
         write_bmp(path, map, sf->w, sf->h);
         vkDestroyBuffer(B.dev, buf, NULL);
         vkFreeMemory(B.dev, mem, NULL);
