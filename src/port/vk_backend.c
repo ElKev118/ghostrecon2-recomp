@@ -405,13 +405,13 @@ static void to_layout(Surface *s, VkImageLayout l)
 static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
 {
     uint32_t w = sf->pitch / (sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
-    uint32_t h = sf->height;
+    uint32_t h = sf->clip_y + sf->height;      /* the clip box ends there */
     Surface *c, *d = NULL;
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingAttachmentInfo da = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
 
-    if (w < sf->width) w = sf->width;
+    if (w < sf->clip_x + sf->width) w = sf->clip_x + sf->width;
     if (!w || !h)
         return 0;
     c = get_surface(sf->color_va, 0, w, h);
@@ -1648,10 +1648,18 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     vp.minDepth = 0.0f;
     vp.maxDepth = 1.0f;
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    sc.offset.x = 0;
-    sc.offset.y = 0;
-    sc.extent.width = sf->width < B.rt_color->w ? sf->width : B.rt_color->w;
-    sc.extent.height = sf->height < B.rt_color->h ? sf->height : B.rt_color->h;
+    /* Scissor = the surface clip box, origin included (xemu draw.c). */
+    {
+        uint32_t x0 = sf->clip_x < B.rt_color->w ? sf->clip_x : B.rt_color->w;
+        uint32_t y0 = sf->clip_y < B.rt_color->h ? sf->clip_y : B.rt_color->h;
+        uint32_t x1 = sf->clip_x + sf->width, y1 = sf->clip_y + sf->height;
+        if (x1 > B.rt_color->w) x1 = B.rt_color->w;
+        if (y1 > B.rt_color->h) y1 = B.rt_color->h;
+        sc.offset.x = (int32_t)x0;
+        sc.offset.y = (int32_t)y0;
+        sc.extent.width = x1 > x0 ? x1 - x0 : 0;
+        sc.extent.height = y1 > y0 ? y1 - y0 : 0;
+    }
     vkCmdSetScissor(cmd, 0, 1, &sc);
     {
         float bc[4] = { ((rs->blend_color >> 16) & 0xFF) / 255.0f,
@@ -2065,10 +2073,26 @@ static void vkb_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
     if (!n)
         return;
-    rect.rect.offset.x = 0;
-    rect.rect.offset.y = 0;
-    rect.rect.extent.width = sf->width < B.rt_color->w ? sf->width : B.rt_color->w;
-    rect.rect.extent.height = sf->height < B.rt_color->h ? sf->height : B.rt_color->h;
+    {
+        /* The clear rectangle registers, inclusive, clamped to the image as
+         * xemu does. A title that never set them (both zero) gets the clip
+         * box. Clearing from (0,0) instead left GR2's weapon slots with the
+         * scene's depth, and the weapon models failed the depth test. */
+        uint32_t x0 = rs->clear_x0, y0 = rs->clear_y0;
+        uint32_t x1 = rs->clear_x1 + 1, y1 = rs->clear_y1 + 1;
+        if (!rs->clear_x1 && !rs->clear_y1) {
+            x0 = sf->clip_x; y0 = sf->clip_y;
+            x1 = sf->clip_x + sf->width; y1 = sf->clip_y + sf->height;
+        }
+        if (x1 > B.rt_color->w) x1 = B.rt_color->w;
+        if (y1 > B.rt_color->h) y1 = B.rt_color->h;
+        if (x0 >= x1 || y0 >= y1)
+            return;
+        rect.rect.offset.x = (int32_t)x0;
+        rect.rect.offset.y = (int32_t)y0;
+        rect.rect.extent.width = x1 - x0;
+        rect.rect.extent.height = y1 - y0;
+    }
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;
     vkCmdClearAttachments(cur()->cmd, n, ca, 1, &rect);

@@ -132,3 +132,30 @@ per-draw 32x32 copies, one whole frame) and combiner dumps
 
 Debug knobs added: RECOMP_VK_FS=fog|nofog|stN|dtex0|dd0 (st*/dtex0/dd0 only
 on the modulate passes), RECOMP_VK_SHADOW=0|1.
+
+## Shadows and exposure: solved (2026-10-21, later)
+
+- Shadow maps were never sampled: texture_view refused a depth texture equal
+  to the *previous* draw's depth attachment, and GR2 draws every receiver
+  pass right after its map. Each of the ~4 passes per soldier darkened the
+  ground x0.65 wherever its geometry went (dark ground depending on camera
+  angle/distance, straight-edged dark regions).
+- Executor recorded raw texture words for stage 0 only (stages 1-3 had no
+  border colour / format word).
+- Vertex colours are clamped to [0,1] (NV2A). Unclamped oD0.a = 1.46 made
+  the ~190 ground detail passes at the base entrance brighten the concrete
+  to white until the title culled them (looked like slow "exposure").
+
+## Open, low priority
+
+- Very distant trees / plains (far LOD, mostly in the opening cinematic sky
+  line and a far plain in gameplay) look teal/cyan where Cxbx shows green.
+  Probably another far-LOD pass (unsupported stage mode or a lookup).
+
+## Performance notes from the user (next big phase)
+
+- Target: >= 60 FPS in gameplay and smooth cinematics. Now 6-18 FPS.
+- Cxbx-Reloaded runs GR2 much faster than xemu (but breaks at high internal
+  resolution: black ground patch, exploding vertices). Worth studying how it
+  avoids per-vertex CPU cost (it uses host vertex shaders).
+- XMV cinematics stutter in both emulators too, a bit less than in the port.
