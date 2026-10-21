@@ -62,6 +62,7 @@ typedef struct {
     uint32_t va, color, w, h, pitch;
     uint64_t hash;
     uint32_t checked_frame;
+    int      changes;           /* contents seen to change since the upload */
     VkImage  img;
     VkDeviceMemory mem;
     VkImageView view;
@@ -259,6 +260,10 @@ static int make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *bu
 
 static Frame *cur(void) { return &B.f[B.fi]; }
 
+/* Per-present statistics: fence waits in begin_frame, submits, uploads. */
+static long long s_stat_wait;
+static unsigned s_stat_begins, s_stat_uploads;
+
 static void begin_frame(void)
 {
     Frame *f = cur();
@@ -267,7 +272,15 @@ static void begin_frame(void)
 
     if (f->recording)
         return;
-    vkWaitForFences(B.dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
+    {
+        /* Time the CPU spends waiting for the GPU here (printed by present). */
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
+        vkWaitForFences(B.dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
+        QueryPerformanceCounter(&t1);
+        s_stat_wait += t1.QuadPart - t0.QuadPart;
+        s_stat_begins++;
+    }
     vkResetFences(B.dev, 1, &f->fence);
     for (i = 0; i < f->nstage; i++) {
         vkDestroyBuffer(B.dev, f->stage[i], NULL);
@@ -540,6 +553,7 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
     if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sb, &sm, &map))
         return 0;
     argb = (uint32_t *)map;
+    s_stat_uploads++;
     if (!nv2a_backend_decode_texture(src, argb))
         memset(argb, 0xFF, bytes);             /* unsupported: white, as the CPU path */
     {
@@ -577,13 +591,12 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
     vkCmdCopyBufferToImage(f->cmd, sb, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     img_barrier(f->cmd, t->img, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    /* Submitted at once. Batched into the frame's command buffer, some
-     * uploads never reached the GPU (Ghost Recon 2's colour-grade strip
-     * came back empty and the graded scene turned to flat grey or red);
-     * uploads happen while loading, so the extra submits cost nothing in
-     * play. ponytail: find out why rather than living with it. */
-    submit_frame();
-    begin_frame();
+    /* Recorded in the frame's command buffer, ahead of the draws that
+     * sample it. (Uploads were once submitted one by one, each submit then
+     * waiting for the GPU -- ~1.7 full CPU/GPU syncs a frame in play. The
+     * strip that "never reached the GPU" when batched was the texture cache
+     * re-checking contents once per submit-numbered frame; small textures
+     * are now re-checked on every use, see texture_view.) */
     return 1;
 }
 
@@ -719,11 +732,18 @@ static VkImageView texture_view(const Nv2aTexStage *st)
             t = &B.tex[i];
             break;
         }
-    if (t && t->checked_frame == B.frame_no) {
+    /* Checked once a frame -- or on every use for a small texture that has
+     * been seen to change: the title rewrites some within a frame (GR2's
+     * colour-grade strip). Hashing every small texture on every use cost a
+     * quarter of the pushbuffer thread. */
+    if (t && t->checked_frame == B.frame_no
+        && !(t->changes && tex_bytes(src) <= 65536u)) {
         t->last_used = B.frame_no;
         return t->view;
     }
     h = hash_bytes(mem + src->offset, tex_bytes(src));
+    if (t && t->img && t->hash != h)
+        t->changes++;
     if (t && t->hash == h) {
         t->checked_frame = B.frame_no;
         t->last_used = B.frame_no;
@@ -2480,8 +2500,14 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
             frames++;
             if (!t0) t0 = now;
             if (now - t0 >= 5000) {
-                fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures)\n",
-                        frames * 1000.0 / (now - t0), B.npipes, B.ntex);
+                LARGE_INTEGER fq;
+                QueryPerformanceFrequency(&fq);
+                fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures) | per frame: "
+                        "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU\n",
+                        frames * 1000.0 / (now - t0), B.npipes, B.ntex,
+                        (double)s_stat_begins / frames, (double)s_stat_uploads / frames,
+                        (double)s_stat_wait * 1000.0 / fq.QuadPart / frames);
+                s_stat_wait = 0; s_stat_begins = 0; s_stat_uploads = 0;
                 frames = 0;
                 t0 = now;
             }
