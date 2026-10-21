@@ -159,3 +159,39 @@ on the modulate passes), RECOMP_VK_SHADOW=0|1.
   resolution: black ground patch, exploding vertices). Worth studying how it
   avoids per-vertex CPU cost (it uses host vertex shaders).
 - XMV cinematics stutter in both emulators too, a bit less than in the port.
+
+## Image quality and settings (planned, after performance)
+
+User's hardware: Ryzen 7 5800X3D + RX 7800 XT (RDNA3); tests now on a
+Ryzen 7 5700G (iGPU) temporarily.
+
+Wanted: SMAA / MSAA / FSR, max sharpness, all selectable from a simple .ini
+(no launcher): output resolution, internal scale, AA mode, sharpening,
+language, volume, fullscreen.
+
+Viability (2026-10-21):
+- Internal-resolution supersampling (2x-4x): best quality, natural for this
+  renderer (all surfaces are ours). The main "high resolution" path.
+- SMAA (or FXAA) on the final image: easy, robust with GR2's post chain.
+- MSAA: hard -- the title samples its own render targets (scene, glow, grade
+  LUT) so every one would need a resolve; little gain over SSAA+SMAA.
+- FSR 1 (EASU upscale + RCAS sharpen): easy, spatial; RCAS also as a
+  sharpening pass at native / supersampled resolution.
+- FSR 2/3/3.1 (incl. Native AA) need per-pixel motion vectors the title does
+  not produce (would need reconstruction from previous-frame vertex
+  positions) -- not viable for now. FSR 4: also RDNA4-only.
+Recommendation: SSAA + SMAA + RCAS, selectable in ghostrecon2.ini.
+
+## Next title
+
+If GR2 ships well, Ghost Recon 2: Summit Strike follows, reusing all of this.
+
+## Pre-rendered video (XMV) stutter -- user notes
+
+- Menu background video: smooth, no pauses.
+- Intro video: pauses audio+video together for ms..seconds. (The Ubisoft
+  logo video is skipped; in xemu it also lags a lot.)
+- In-engine cinematics stall because the game thread waits on GPU fences
+  (84% of its time in D3D_BlockOnTime while the pb thread runs vertex
+  programs on the CPU). To re-measure after GPU vertex programs; the intro
+  XMV needs its own profile (decode / DVD streaming / VBlank pacing).

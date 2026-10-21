@@ -32,6 +32,7 @@
 #include "vk_ctx.h"
 #include "vk_glsl.h"
 #include "nv2a_backend.h"
+#include "nv2a_vsh_glsl.h"
 
 #define VKB_FRAMES        2
 #define VKB_VBUF_BYTES    (48u << 20)          /* vertex ring per frame */
@@ -68,9 +69,33 @@ typedef struct {
 } Tex;
 
 typedef struct {
-    uint64_t key[3];
+    uint64_t key[4];            /* key[3]: GPU vertex program (0: transformed) */
     VkPipeline pipe;
 } Pipe;
+
+/* A vertex program compiled for the GPU (draw_vsh), by content. */
+typedef struct {
+    uint64_t hash;
+    uint32_t inputs;            /* v registers it reads */
+    VkShaderModule mod;
+} VshProg;
+#define VKB_MAX_VSH 256
+#define VSH_UBO_BYTES 3328u     /* 192 vec4 + 1, rounded to 256 */
+
+/* Set while draw_vertices draws a draw_vsh batch: untransformed inputs and an
+ * index list, the program's module and constants. */
+typedef struct {
+    const VshProg *prog;
+    uint32_t id;                /* index in B.vsh, +1 */
+    const float *inputs;
+    uint32_t nverts, ninputs;
+    uint8_t regs[16];
+    const uint32_t *indices;
+    uint32_t nindices;
+    const float (*constants)[4];
+    float aa[2];
+} VshDraw;
+static const VshDraw *s_vsh;
 
 typedef struct {
     VkCommandBuffer cmd;
@@ -104,6 +129,8 @@ static struct {
     int ntex;
     Pipe pipes[VKB_MAX_PIPELINES];
     int npipes;
+    VshProg vsh[VKB_MAX_VSH];
+    int nvsh;
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -1122,12 +1149,12 @@ static int poly_offset_on(const Nv2aRenderState *rs, int has_depth)
 
 static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
 {
-    uint64_t k0, k1, k2;
+    uint64_t k0, k1, k2, k3 = s_vsh ? s_vsh->id : 0;
     int i;
     VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
     VkPipelineShaderStageCreateInfo stages[2];
     VkVertexInputBindingDescription vb = { 0, sizeof(Nv2aVertexXf), VK_VERTEX_INPUT_RATE_VERTEX };
-    VkVertexInputAttributeDescription va[8];
+    VkVertexInputAttributeDescription va[16];
     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
@@ -1157,7 +1184,8 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
        | ((uint64_t)(rs->stencil_fail & 0xFFFF) << 20) | ((uint64_t)(rs->stencil_zfail & 0xFFFF) << 36)
        | ((uint64_t)(rs->stencil_zpass & 0xFFF) << 52);
     for (i = 0; i < B.npipes; i++)
-        if (B.pipes[i].key[0] == k0 && B.pipes[i].key[1] == k1 && B.pipes[i].key[2] == k2)
+        if (B.pipes[i].key[0] == k0 && B.pipes[i].key[1] == k1 && B.pipes[i].key[2] == k2
+            && B.pipes[i].key[3] == k3)
             return B.pipes[i].pipe;
     if (B.npipes >= VKB_MAX_PIPELINES)
         return B.pipes[0].pipe;
@@ -1165,7 +1193,7 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     memset(stages, 0, sizeof stages);
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = B.vs;
+    stages[0].module = s_vsh ? s_vsh->prog->mod : B.vs;
     stages[0].pName = "main";
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = ((k0 >> 58) & 1) ? B.fs_zofs : B.fs;
@@ -1180,6 +1208,17 @@ static VkPipeline get_pipeline(const Nv2aRenderState *rs, int has_depth)
     vi.pVertexBindingDescriptions = &vb;
     vi.vertexAttributeDescriptionCount = 8;
     vi.pVertexAttributeDescriptions = va;
+    if (s_vsh) {
+        /* The program's inputs, packed in register order. */
+        vb.stride = s_vsh->ninputs * 16;
+        for (i = 0; i < (int)s_vsh->ninputs; i++) {
+            va[i].location = s_vsh->regs[i];
+            va[i].binding = 0;
+            va[i].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            va[i].offset = (uint32_t)(i * 16);
+        }
+        vi.vertexAttributeDescriptionCount = s_vsh->ninputs;
+    }
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vp.viewportCount = 1;
     vp.scissorCount = 1;
@@ -1254,6 +1293,7 @@ cull_done:
     B.pipes[B.npipes].key[0] = k0;
     B.pipes[B.npipes].key[1] = k1;
     B.pipes[B.npipes].key[2] = k2;
+    B.pipes[B.npipes].key[3] = k3;
     B.pipes[B.npipes++].pipe = p;
     return p;
 }
@@ -1266,9 +1306,11 @@ static int init(void)
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkDescriptorSetLayoutBinding bind[2] = {
+    VkDescriptorSetLayoutBinding bind[3] = {
         { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL } };
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        /* draw_vsh: the vertex program's constants (and the AA scale) */
+        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL } };
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                 0, sizeof(PushConsts) };
@@ -1300,7 +1342,7 @@ static int init(void)
         cai.commandBufferCount = 1;
         vkAllocateCommandBuffers(B.dev, &cai, &B.f[i].cmd);
         vkCreateFence(B.dev, &fci, NULL, &B.f[i].fence);
-        if (!make_buffer(VKB_VBUF_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        if (!make_buffer(VKB_VBUF_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                          &B.f[i].vbuf, &B.f[i].vmem, (void **)&B.f[i].vmap))
             return 0;
         if (!make_buffer(VKB_UBUF_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1309,7 +1351,7 @@ static int init(void)
     }
 
     dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    dli.bindingCount = 2;
+    dli.bindingCount = 3;
     dli.pBindings = bind;
     vkCreateDescriptorSetLayout(B.dev, &dli, NULL, &B.dsl);
     pli.setLayoutCount = 1;
@@ -1366,8 +1408,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     float cmin[4][2];
     uint32_t shadow_mask = 0;
     float shadow_max[4] = { 1, 1, 1, 1 };
-    VkDescriptorBufferInfo ubi;
-    VkWriteDescriptorSet w2[2];
+    VkDescriptorBufferInfo ubi, vbi;
+    VkWriteDescriptorSet w2[3];
     Frame *f;
     VkCommandBuffer cmd;
     VkPipeline pipe;
@@ -1377,16 +1419,25 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     VkViewport vp;
     VkRect2D sc;
     VkDeviceSize off;
-    uint32_t bytes = count * (uint32_t)sizeof(Nv2aVertexXf);
+    /* draw_vsh: program inputs then the index list; else transformed
+     * vertices. Debug output below reads v[0]: a zero vertex then. */
+    static const Nv2aVertexXf zero_v;
+    uint32_t vbytes = s_vsh ? s_vsh->nverts * s_vsh->ninputs * 16u
+                            : count * (uint32_t)sizeof(Nv2aVertexXf);
+    uint32_t ibytes = s_vsh ? s_vsh->nindices * 4u : 0;
+    uint32_t bytes = ((vbytes + 255u) & ~255u) + ibytes;
+    uint32_t ubytes = 512u + (s_vsh ? VSH_UBO_BYTES : 0u);
     int st;
 
     if (!count || !init())
         return;
+    if (!v)
+        v = &zero_v;
     begin_frame();
     if (bytes > VKB_VBUF_BYTES)
         return;
     if (cur()->vused + bytes > VKB_VBUF_BYTES
-        || cur()->uused + 512u > VKB_UBUF_BYTES) {
+        || cur()->uused + ubytes > VKB_UBUF_BYTES) {
         submit_frame();
         begin_frame();
     }
@@ -1517,7 +1568,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     stages ? stages[0].t.offset : 0, stages ? stages[0].enabled : 0);
         if (watch && (sf->color_va & 0x0FFFFFFFu) == watch && said <= 3) {
             uint32_t k;
-            for (k = 0; k < count && k < 6; k++)
+            for (k = 0; !s_vsh && k < count && k < 6; k++)
                 fprintf(stderr, "[VKB]   v%u pos %.2f %.2f  t0 %.3f %.3f %.3f %.3f  t1 %.3f %.3f %.3f %.3f"
                         "  t2 %.3f %.3f  t3 %.3f %.3f\n", k, v[k].pos[0], v[k].pos[1],
                         v[k].tex[0][0], v[k].tex[0][1], v[k].tex[0][2], v[k].tex[0][3],
@@ -1531,8 +1582,13 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     if (!pipe)
         return;
 
-    memcpy(f->vmap + f->vused, v, bytes);
     off = f->vused;
+    if (s_vsh) {
+        memcpy(f->vmap + f->vused, s_vsh->inputs, vbytes);
+        memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
+    } else {
+        memcpy(f->vmap + f->vused, v, vbytes);
+    }
     f->vused += (bytes + 255u) & ~255u;
 
     memset(&ubo, 0, sizeof ubo);
@@ -1591,6 +1647,16 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     ubi.offset = f->uused;
     ubi.range = sizeof ubo;
     f->uused += 512u;    /* sizeof(RcUbo) <= 512, offset alignment */
+    if (s_vsh) {
+        /* c[0..191] then the anti-aliasing scale (std140: vec4s). */
+        float aa[4] = { s_vsh->aa[0], s_vsh->aa[1], 0.0f, 0.0f };
+        memcpy(f->umap + f->uused, s_vsh->constants, 192 * 16);
+        memcpy(f->umap + f->uused + 192 * 16, aa, sizeof aa);
+        vbi.buffer = f->ubuf;
+        vbi.offset = f->uused;
+        vbi.range = 192 * 16 + 16;
+        f->uused += VSH_UBO_BYTES;
+    }
 
     pc.surf[0] = (float)sf->pitch / (float)(sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
     if (pc.surf[0] < (float)sf->width) pc.surf[0] = (float)sf->width;
@@ -1638,7 +1704,12 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     w2[1].descriptorCount = 1;
     w2[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w2[1].pBufferInfo = &ubi;
-    pfnPushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, 2, w2);
+    if (s_vsh) {
+        w2[2] = w2[1];
+        w2[2].dstBinding = 2;
+        w2[2].pBufferInfo = &vbi;
+    }
+    pfnPushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, s_vsh ? 3 : 2, w2);
     vkCmdPushConstants(cmd, B.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof pc, &pc);
     vp.x = 0;
@@ -1670,7 +1741,12 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
     vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, rs->stencil_ref & 0xFF);
     vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
-    vkCmdDraw(cmd, count, 1, 0, 0);
+    if (s_vsh) {
+        vkCmdBindIndexBuffer(cmd, f->vbuf, off + ((vbytes + 255u) & ~255u), VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, s_vsh->nindices, 1, 0, 0, 0);
+    } else {
+        vkCmdDraw(cmd, count, 1, 0, 0);
+    }
     {
         /* RECOMP_VK_SYNC_EACH=1: end rendering + full barrier after every
          * draw; =2: also submit and wait. Hazard hunting. */
@@ -1929,7 +2005,7 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
                     b->state->stencil_fail, b->state->stencil_zfail, b->state->stencil_zpass,
                     b->state->alpha_test_enable, b->state->alpha_func, b->state->alpha_ref,
                     b->state->color_mask);
-            for (i = 0; i < (int)b->count && i < 6; i++)
+            for (i = 0; b->vertices && i < (int)b->count && i < 6; i++)
                 fprintf(stderr, "[RC]  v%d pos %.3f %.3f %.3f %.3f t0 %.3f %.3f %.3f %.3f\n", i,
                         b->vertices[i].pos[0], b->vertices[i].pos[1], b->vertices[i].pos[2],
                         b->vertices[i].pos[3], b->vertices[i].tex[0][0], b->vertices[i].tex[0][1],
@@ -2419,8 +2495,139 @@ static void vkb_flip(void)
 {
 }
 
+/* ---- draw_vsh: vertex programs on the GPU ------------------------------ */
+
+static const char *VSH_OUTPUTS =
+    "layout(push_constant) uniform PC { vec4 surf; vec4 texscale[4]; ivec4 alpha; vec4 clampmax[2]; } pc;\n"
+    "layout(std140, set = 0, binding = 2) uniform VSHC { vec4 cst[192]; vec4 vaa; };\n"
+    "layout(location=0) out vec4 vD0;\n"
+    "layout(location=1) out vec4 vD1;\n"
+    "layout(location=2) out vec4 vFog;\n"
+    "layout(location=3) out vec4 vT[4];\n";
+
+/* After the program: what the CPU path does to a transformed vertex
+ * (transform_vertex, then VS_SRC), so both paths draw the same thing. */
+static const char *VSH_EPILOGUE =
+    "  vec4 p = oPos;\n"
+    "  if (floatBitsToUint(p.w) == 0u) p.w = 1.0;\n"   /* +0: no divide by w */
+    "  p.xy *= vaa.xy;\n"
+    "  float w = p.w;\n"
+    "  vec2 sp = trunc(p.xy * 16.0) / 16.0;\n"
+    "  vec3 ndc = vec3(sp.x / pc.surf.x * 2.0 - 1.0,\n"
+    "                  sp.y / pc.surf.y * 2.0 - 1.0,\n"
+    "                  p.z * pc.surf.z);\n"
+    "  gl_Position = vec4(ndc * w, w);\n"
+    "  vD0 = clamp(mix(o[3], vec4(1.0), isnan(o[3])), 0.0, 1.0);\n"
+    "  vD1 = clamp(mix(o[4], vec4(1.0), isnan(o[4])), 0.0, 1.0);\n"
+    "  vFog = o[5];\n"
+    "  vT[0] = o[9]; vT[1] = o[10]; vT[2] = o[11]; vT[3] = o[12];\n";
+
+/* The compiled program for this batch, from the cache or built now. */
+static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
+{
+    uint32_t mask = 0, k;
+    size_t cap = 512u << 10, n;
+    char *src, *body;
+    VshProg *p;
+    int i;
+
+    for (k = 0; k < b->ninputs; k++)
+        mask |= 1u << b->input_reg[k];
+    for (i = 0; i < B.nvsh; i++)
+        if (B.vsh[i].hash == b->program_hash && B.vsh[i].inputs == mask) {
+            *id = (uint32_t)i + 1;
+            return B.vsh[i].mod ? &B.vsh[i] : NULL;
+        }
+    if (B.nvsh >= VKB_MAX_VSH)
+        return NULL;
+    p = &B.vsh[B.nvsh];
+    memset(p, 0, sizeof *p);
+    p->hash = b->program_hash;
+    p->inputs = mask;
+    *id = (uint32_t)B.nvsh + 1;
+    B.nvsh++;                    /* a failed compile stays cached as NULL */
+    src = (char *)malloc(cap);
+    body = (char *)malloc(cap);
+    if (!src || !body) {
+        free(src); free(body);
+        return NULL;
+    }
+    if (!nv2a_vsh_glsl(b->program, b->nslots, b->start, body, cap)) {
+        fprintf(stderr, "[VKB] vertex program %016llX: GLSL generation failed\n",
+                (unsigned long long)b->program_hash);
+        free(src); free(body);
+        return NULL;
+    }
+    n = (size_t)snprintf(src, cap, "#version 450\n");
+    for (k = 0; k < 16; k++)
+        if (mask & (1u << k))
+            n += (size_t)snprintf(src + n, cap - n, "layout(location=%u) in vec4 in_%u;\n", k, k);
+    n += (size_t)snprintf(src + n, cap - n, "%s%s", VSH_OUTPUTS, nv2a_vsh_glsl_prelude());
+    n += (size_t)snprintf(src + n, cap - n,
+                          "void main() {\n  vec4 v[16];\n"
+                          "  for (int k = 0; k < 16; k++) v[k] = vec4(0.0, 0.0, 0.0, 1.0);\n");
+    for (k = 0; k < 16; k++)
+        if (mask & (1u << k))
+            n += (size_t)snprintf(src + n, cap - n, "  v[%u] = in_%u;\n", k, k);
+    n += (size_t)snprintf(src + n, cap - n, "%s%s}\n", body, VSH_EPILOGUE);
+    if (n >= cap) {
+        free(src); free(body);
+        return NULL;
+    }
+    p->mod = make_module(src, 0);
+    {
+        static unsigned said;
+        if (said++ < 64)
+            fprintf(stderr, "[VKB] vertex program %016llX (inputs %04X): %s\n",
+                    (unsigned long long)p->hash, mask, p->mod ? "compiled" : "COMPILE FAILED");
+        if (!p->mod && getenv("RECOMP_VK_VSH_DUMP")) {
+            FILE *fp = fopen("vsh_failed.glsl", "wb");
+            if (fp) { fputs(src, fp); fclose(fp); }
+        }
+    }
+    free(src);
+    free(body);
+    return p->mod ? p : NULL;
+}
+
+static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
+{
+    VshDraw d;
+    Nv2aBatchXf x;
+    VshProg *p;
+    uint32_t id = 0;
+
+    if (B.failed || !init())
+        return 0;
+    if (b->ninputs > 16 || !b->nindices)
+        return 0;
+    p = vsh_get(b, &id);
+    if (!p)
+        return 0;                              /* the CPU path draws it */
+    memset(&d, 0, sizeof d);
+    d.prog = p;
+    d.id = id;
+    d.inputs = b->inputs;
+    d.nverts = b->nverts;
+    d.ninputs = b->ninputs;
+    memcpy(d.regs, b->input_reg, sizeof d.regs);
+    d.indices = b->indices;
+    d.nindices = b->nindices;
+    d.constants = b->constants;
+    d.aa[0] = b->aa_sx;
+    d.aa[1] = b->aa_sy;
+    x.vertices = NULL;
+    x.count = b->nindices;
+    x.state = b->state;
+    x.pixel = b->pixel;
+    s_vsh = &d;
+    vkb_draw_xf(sf, &x);
+    s_vsh = NULL;
+    return 1;
+}
+
 static const Nv2aBackend s_vk_backend = {
-    vkb_clear, vkb_draw, vkb_flip, vkb_draw_xf, vkb_blit, vkb_present
+    vkb_clear, vkb_draw, vkb_flip, vkb_draw_xf, vkb_blit, vkb_present, vkb_draw_vsh
 };
 
 /* Called from main() after the window has been started. */
