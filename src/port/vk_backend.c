@@ -923,6 +923,8 @@ static const char *FS_SRC =
     "    } else c = R[12];\n"
     "  }\n"
     "  c = clamp(c, 0.0, 1.0);\n"
+    "  if (pc.alpha.w == 5 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[9].rgb, 1.0);\n"
+    "  if (pc.alpha.w == 6 && ((rc.ctl.y >> 5) & 31u) == 15u) c = vec4(R[8].rgb, 1.0);\n"
     "  if (pc.alpha.w == 1) c = vec4(1.0, 0.0, 1.0, 1.0);\n"
     "  else if (pc.alpha.w == 2) c = vec4(vD0.rgb, 1.0);\n"
     "  else if (pc.alpha.w == 3) c = vec4(samp(0, vT[0].xy * pc.texscale[0].xy).rgb, 1.0);\n"
@@ -1269,6 +1271,13 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         ii[st].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         if (view) {
             pc.texscale[st][2] = 1.0f;
+            if (stages && ((stages[0].t.offset ^ 0) , ((px ? px->stage_program : 0) >> 5 & 31) == 15)) {
+                static unsigned said;
+                if (said++ < 12)
+                    fprintf(stderr, "[VKB] grade stage %d: tex %08X %ux%u fmt %02X norm %u -> image %ux%u\n",
+                            st, stages[st].t.offset, stages[st].t.width, stages[st].t.height,
+                            stages[st].t.color, stages[st].normalised, s_view_w, s_view_h);
+            }
             {
                 /* Image size: the texture's own, or the surface's when the
                  * texture is a rendered surface (possibly larger). */
@@ -1387,7 +1396,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (dbg < 0) {
             const char *e = getenv("RECOMP_VK_FS");
             dbg = !e ? 0 : !strcmp(e, "magenta") ? 1 : !strcmp(e, "d0") ? 2
-                : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4 : 0;
+                : !strcmp(e, "t0") ? 3 : !strcmp(e, "noalpha") ? 4
+                : !strcmp(e, "gradeAR") ? 5 : !strcmp(e, "gradeT0") ? 6 : 0;
         }
         pc.alpha[3] = dbg;
     }
