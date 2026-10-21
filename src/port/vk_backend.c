@@ -128,6 +128,7 @@ static struct {
     int failed;
     uint32_t write_seq;
     uint32_t next_target, next_target_w;   /* colour target of the draw being set up */
+    uint32_t next_zeta;                    /* and its depth surface (va key, 0 none) */
 } B;
 
 static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
@@ -352,7 +353,8 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
     }
     s = &B.surf[slot];
     if (!make_image(w, h, depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
-                    depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+                    depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                           : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
                     depth, &s->img, &s->mem, &s->view))
@@ -605,7 +607,11 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         /* A depth texture is a depth surface we rendered: sample its depth
          * aspect and let the shader compare (shadow map). */
         Surface *dz = find_surface_w(src->offset, 1, 0);
-        if (!dz || dz == B.rt_depth)
+        /* Refused only when it is this draw's own depth attachment. The
+         * attachment of the *previous* draw (B.rt_depth) is no reason: GR2
+         * draws each shadow receiver pass right after rendering the map,
+         * so that test threw away every shadow map. */
+        if (!dz || (B.next_zeta && dz->va == B.next_zeta))
             return NULL;
         to_layout(dz, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         s_view_w = dz->w; s_view_h = dz->h;
@@ -820,7 +826,14 @@ static const char *VS_SRC =
     "                  sp.y / pc.surf.y * 2.0 - 1.0,\n"
     "                  inPos.z * pc.surf.z);\n"
     "  gl_Position = vec4(ndc * w, w);\n"
-    "  vD0 = inD0; vD1 = inD1; vFog = inFog;\n"
+    /* The NV2A clamps the vertex colours to [0,1] before interpolation
+     * (xemu: vtxD0 = clamp(NaNToOne(oD0), 0, 1)). Vertex programs write
+     * more (GR2's ground detail passes: oD0.a = 1.46), and unclamped every
+     * detail pass brightened instead of staying neutral -- 190 stacked passes
+     * burnt the base entrance white. */
+    "  vD0 = clamp(mix(inD0, vec4(1.0), isnan(inD0)), 0.0, 1.0);\n"
+    "  vD1 = clamp(mix(inD1, vec4(1.0), isnan(inD1)), 0.0, 1.0);\n"
+    "  vFog = inFog;\n"
     "  vT[0] = inT0; vT[1] = inT1; vT[2] = inT2; vT[3] = inT3;\n"
     "}\n";
 
@@ -867,10 +880,16 @@ static const char *FS_SRC =
     /* BORDER addressing with the border colour register: outside [0,1] the
      * stage reads that colour (Ghost Recon 2's ground detail decals use a
      * neutral grey there; a black border blackened the ground). */
+    /* The texture's own extent: the whole image, or for a texture inside a
+     * larger surface (GR2's 300x300 shadow maps in a 320x300 one) the part
+     * clampmin/clampmax bracket by half a texel. Clamping instead stretched
+     * the edge texels outward -- shadows of whatever sat on a cascade's edge
+     * spread over the ground, changing as the cascades moved with the view. */
     "  uint bm = (rc.bmask.x >> uint(st * 2)) & 3u;\n"
-    "  if (bm != 0u && mx.x <= 0.0\n"
-    "      && (((bm & 1u) != 0u && (uv.x < 0.0 || uv.x > 1.0))\n"
-    "          || ((bm & 2u) != 0u && (uv.y < 0.0 || uv.y > 1.0))))\n"
+    "  vec2 lim = mx.x > 0.0 ? mx + mn : vec2(1.0);\n"
+    "  if (bm != 0u\n"
+    "      && (((bm & 1u) != 0u && (uv.x < 0.0 || uv.x > lim.x))\n"
+    "          || ((bm & 2u) != 0u && (uv.y < 0.0 || uv.y > lim.y))))\n"
     "    return unpk(rc.border[st]);\n"
     "  if (mx.x > 0.0) uv = clamp(uv, mn, mx);\n"
     "  if (st == 0) return texture(tex[0], uv);\n"
@@ -928,6 +947,18 @@ static const char *FS_SRC =
     "        else if (f == 6u) r = d >= z; else r = true;\n"
     "        if (rc.shadow.z == 1u) r = false; else if (rc.shadow.z == 2u) r = true;\n"
     "        t[st] = vec4(r ? 1.0 : 0.0);\n"
+    /* RECOMP_VK_FS=shd: stage 0's decision as the pass colour (on the
+     * DST*(1-SRC) shadow passes the probe turns it back: src = 1 - after /
+     * before). r 0.5 = inside the map, g 0.5 = compared shadowed, b 0.5 =
+     * stored depth is the far clear. */
+    "        if (pc.alpha.w == 30 && st == 0) {\n"
+    "          vec4 cm = pc.clampmax[0]; vec4 cn = rc.clampmin[0];\n"
+    "          vec2 lim = cm.x > 0.0 ? cm.xy + cn.xy : vec2(1.0);\n"
+    "          vec2 uv = tc.xy / q * pc.texscale[0].xy;\n"
+    "          bool ins = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, lim));\n"
+    "          outColor = vec4(ins ? 0.5 : 0.0, r ? 0.0 : 0.5, d >= rc.shadowmax[0] * 0.999 ? 0.5 : 0.0, 0.0);\n"
+    "          return;\n"
+    "        }\n"
     "      }\n"
     "      else if (mode == 1u || mode == 2u || mode == 3u)\n"
     "        t[st] = samp(st, tc.xy / q * pc.texscale[st].xy);\n"
@@ -1383,6 +1414,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         }
     }
     B.next_target = va_key(sf->color_va);
+    B.next_zeta = rs->zeta_va ? va_key(rs->zeta_va) : 0;
     B.next_target_w = sf->pitch / (sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
     if (B.next_target_w < sf->width) B.next_target_w = sf->width;
     for (st = 0; st < 4; st++) {
@@ -1579,7 +1611,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 : !strcmp(e, "gradeAR") ? 5 : !strcmp(e, "gradeT0") ? 6
                 : !strcmp(e, "fog") ? 7 : !strcmp(e, "nofog") ? 8
                 : !strncmp(e, "st", 2) ? 10 + atoi(e + 2)
-                : !strcmp(e, "dtex0") ? 20 : !strcmp(e, "dd0") ? 21 : 0;
+                : !strcmp(e, "dtex0") ? 20 : !strcmp(e, "dd0") ? 21
+                : !strcmp(e, "shd") ? 30 : 0;
         }
         /* Not on full-screen quads: the post-process passes would paint
          * the debug output over the whole scene. */
@@ -1587,7 +1620,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         /* st*, dtex0, dd0: only on the modulate (DST_COLOR/SRC_COLOR) passes,
          * whose output the probe can turn back into the shader's: out =
          * 2 * src * dst. */
-        if (dbg >= 10 && !(rs->blend_enable && rs->blend_src == 0x306))
+        if (dbg >= 10 && dbg < 30 && !(rs->blend_enable && rs->blend_src == 0x306))
+            pc.alpha[3] = 0;
+        if (dbg == 30 && !(rs->blend_enable && rs->blend_dst == 0x301))
             pc.alpha[3] = 0;
     }
 
@@ -1762,8 +1797,6 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             for (i = 0; i < idx; i++) {
                 const ProbeRec *r = &s_probe_rec[i];
                 int s;
-                if (!(r->blend && r->bsrc == 0x306))
-                    continue;
                 fprintf(stderr, "[PROBE] rc #%d seen %u ctl %08X d0 %.3f %.3f %.3f %.3f tc0 %.3f %.3f %.3f %.3f\n",
                         i, r->seen, r->ctl, r->d0[0], r->d0[1], r->d0[2], r->d0[3],
                         r->tc0[0], r->tc0[1], r->tc0[2], r->tc0[3]);
@@ -1772,7 +1805,19 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                             i, s, r->cicw[s], r->aicw[s], r->cocw[s], r->aocw[s], r->k0[s], r->k1[s]);
             }
             fflush(stderr);
-            dump_surfaces("pr_", 0);
+            {
+                /* Re-arm: each new probe.flag takes another frame, so two
+                 * captures of one view (before / after something changes)
+                 * can be compared. Surfaces go to pr<N>_. */
+                static unsigned shot;
+                char pre[16];
+                snprintf(pre, sizeof pre, "pr%u_", shot);
+                dump_surfaces(pre, 0);
+                fprintf(stderr, "[PROBE] capture %u written (%s*)\n", shot, pre);
+                shot++;
+                DeleteFileA("probe.flag");
+                active = 0; done = 0; idx = 0; s_probe_armed = 0;
+            }
             begin_frame();
             B.rt_color = NULL;
         }
@@ -1810,6 +1855,34 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
     if (B.failed)
         return;
     {
+        /* RECOMP_VK_SKIP_TEX=<va>: drop every draw that samples that
+         * address on any stage (diagnostic: what a pass contributes). */
+        static uint32_t skip = 1;
+        int k;
+        if (skip == 1) {
+            const char *e = getenv("RECOMP_VK_SKIP_TEX");
+            skip = e ? (uint32_t)strtoul(e, NULL, 16) & 0x0FFFFFFFu : 0;
+        }
+        for (k = 0; skip && k < 4; k++)
+            if (b->pixel->stage[k].enabled
+                && (b->pixel->stage[k].t.offset & 0x0FFFFFFFu) == skip
+                && ((b->pixel->stage_program >> (k * 5)) & 31) != 0)
+                return;
+    }
+    {
+        /* RECOMP_VK_SKIP_UNSUP=1: drop draws whose texture shader uses a
+         * mode the uber-shader does not implement (cube maps, dot products,
+         * bump env) -- diagnostic until those exist. */
+        static int on = -1;
+        uint32_t sp = b->pixel->stage_program, k;
+        if (on < 0) on = getenv("RECOMP_VK_SKIP_UNSUP") != NULL;
+        for (k = 0; on && k < 4; k++) {
+            uint32_t m = (sp >> (k * 5)) & 31;
+            if (m && m != 1 && m != 2 && m != 4 && m != 5 && m != 15 && m != 16)
+                return;
+        }
+    }
+    {
         /* RECOMP_VK_RC_DUMP=<prog hex>: the raw combiner registers of the
          * first few draws with that stage program. */
         static int want = -2, said;
@@ -1832,10 +1905,11 @@ static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
                 fprintf(stderr, "[RC]  %d: cI %08X aI %08X cO %08X aO %08X f0 %08X f1 %08X\n", i,
                         p->color_icw[i], p->alpha_icw[i], p->color_ocw[i], p->alpha_ocw[i],
                         p->factor0[i], p->factor1[i]);
-            fprintf(stderr, "[RC]  stage0 tex %08X %ux%u fmt %02X levels %u addr %u/%u filter %08X norm %u en %u fmtword %08X ctl0 %08X border %08X\n",
-                    p->stage[0].t.offset, p->stage[0].t.width, p->stage[0].t.height, p->stage[0].t.color,
-                    p->stage[0].t.levels, p->stage[0].t.addr_u, p->stage[0].t.addr_v, p->stage[0].t.filter,
-                    p->stage[0].normalised, p->stage[0].enabled, p->stage[0].format_word, p->stage[0].control0, p->stage[0].border_color);
+            for (i = 0; i < 4; i++)
+                fprintf(stderr, "[RC]  stage%d tex %08X %ux%u fmt %02X levels %u addr %u/%u filter %08X norm %u en %u fmtword %08X ctl0 %08X border %08X\n",
+                        i, p->stage[i].t.offset, p->stage[i].t.width, p->stage[i].t.height, p->stage[i].t.color,
+                        p->stage[i].t.levels, p->stage[i].t.addr_u, p->stage[i].t.addr_v, p->stage[i].t.filter,
+                        p->stage[i].normalised, p->stage[i].enabled, p->stage[i].format_word, p->stage[i].control0, p->stage[i].border_color);
             fprintf(stderr, "[RC]  target %08X %ux%u pitch %u, %u verts, zeta %08X fmt %u\n",
                     sf->color_va, sf->width, sf->height, sf->pitch, b->count,
                     b->state->zeta_va, p->zeta_format);
@@ -1951,6 +2025,15 @@ static void vkb_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     if (B.failed || !init())
         return;
     begin_frame();
+    {
+        /* Clears that touch the shadow-map address, logged for a while. */
+        static unsigned said;
+        if (((sf->color_va & 0x0FFFFFFFu) == 0x00A17000u
+             || (rs->zeta_va & 0x0FFFFFFFu) == 0x00A17000u) && said++ < 40)
+            fprintf(stderr, "[VKB] clear flags %02X colour %08X %ux%u zeta %08X fmt %u zs %08X argb %08X\n",
+                    flags, sf->color_va, sf->width, sf->height, rs->zeta_va,
+                    rs->zeta_format, zs, argb);
+    }
     if (!bind_target(sf, (flags & 3) ? rs->zeta_va : 0))
         return;
     if (flags & 0xF0) {
@@ -2108,13 +2191,43 @@ static void dump_surfaces(const char *prefix, unsigned shot)
         char path[512];
         size_t k, n;
 
-        if (!sf->img || sf->depth)
+        if (!sf->img)
             continue;
         if (!make_buffer((VkDeviceSize)sf->w * sf->h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                          &buf, &mem, (void **)&map))
             return;
         begin_frame();
         to_layout(sf, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        if (sf->depth) {
+            /* Depth aspect as grey (0 near .. 255 far), with its range. */
+            float *z = (float *)map, lo = 1e30f, hi = -1e30f;
+            size_t nfar = 0;
+            memset(&c, 0, sizeof c);
+            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            c.imageSubresource.layerCount = 1;
+            c.imageExtent.width = sf->w; c.imageExtent.height = sf->h; c.imageExtent.depth = 1;
+            vkCmdCopyImageToBuffer(cur()->cmd, sf->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   buf, 1, &c);
+            submit_frame();
+            vkDeviceWaitIdle(B.dev);
+            n = (size_t)sf->w * sf->h;
+            for (k = 0; k < n; k++) {
+                float v = z[k];
+                uint8_t g;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+                if (v >= 0.9999f) nfar++;
+                g = (uint8_t)(v <= 0.0f ? 0 : v >= 1.0f ? 255 : v * 255.0f);
+                map[k * 4] = map[k * 4 + 1] = map[k * 4 + 2] = g; map[k * 4 + 3] = 255;
+            }
+            snprintf(path, sizeof path, "%s%04u_%08X_w%u_z.bmp", prefix, shot, sf->va, sf->w);
+            write_bmp(path, map, sf->w, sf->h);
+            fprintf(stderr, "[VKB] depth %08X %ux%u: min %.6f (%.0f) max %.6f (%.0f), %zu of %zu far\n",
+                    sf->va, sf->w, sf->h, lo, lo * 65535.0f, hi, hi * 65535.0f, nfar, n);
+            vkDestroyBuffer(B.dev, buf, NULL);
+            vkFreeMemory(B.dev, mem, NULL);
+            continue;
+        }
         memset(&c, 0, sizeof c);
         c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         c.imageSubresource.layerCount = 1;

@@ -1,5 +1,5 @@
 @echo off
-rem Activa la sonda: el juego se pone muy lento ~1 minuto mientras mide.
+rem Captura un fotograma con la sonda (unos segundos). Se puede usar varias veces.
 type nul > "%~dp0build\Release\probe.flag"
-echo Sonda activada. Espera ~1 minuto y luego cierra el juego.
+echo Sonda activada: captura en unos segundos.
 timeout /t 5
