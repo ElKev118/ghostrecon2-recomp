@@ -392,10 +392,20 @@ static void submit_frame(void)
  * table into the buffer.
  *
  * find_surface: want_w = 0 means "any width": the one written last. */
+/* One bit per hashed surface address ever created: most textures are not
+ * surfaces, and every texture stage of every draw asked, by scanning all of
+ * them twice. A bit stays set once a surface leaves: that costs a scan,
+ * never a wrong answer. */
+static uint64_t s_surf_bits[64];
+#define SURF_BIT(key) (((key) >> 8 ^ (key) >> 20) & 4095u)
+
 static Surface *find_surface_w(uint32_t va, int depth, uint32_t want_w)
 {
     Surface *best = NULL;
+    uint32_t key = va_key(va), bit = SURF_BIT(key);
     int i;
+    if (!(s_surf_bits[bit >> 6] >> (bit & 63) & 1u))
+        return NULL;
     for (i = 0; i < VKB_MAX_SURFACES; i++) {
         Surface *c = &B.surf[i];
         if (!c->img || c->depth != depth || c->va != va_key(va))
@@ -460,6 +470,10 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
                     depth, &s->img, &s->mem, &s->view))
         return NULL;
     s->va = va_key(va);
+    {
+        uint32_t bit = SURF_BIT(s->va);
+        s_surf_bits[bit >> 6] |= 1ull << (bit & 63);
+    }
     s->depth = depth;
     s->w = w;
     s->h = h;
