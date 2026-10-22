@@ -247,3 +247,13 @@ Volatile stays only where the title polls memory (spin loops on MMIO /
 shared flags). Expected: large gain on the main thread (estimate 1.5-2x),
 benefits every title. Needs a full regen + build (~45 min) and careful
 validation (SEH unwinding, ABI checks, the fpdiff/c_fixture tests).
+
+Done 2026-10-21 (toolkit 4dc3ee3, 2e98a2f): RECOMP_LOCAL_REGS, GPRs and
+xmm0-7 as locals, synced only for the registers each function names. With
+the executor fixes after it, automated forest view, no frame limit, 5700G:
+53 -> ~75 FPS. The game thread now waits ~28 % on the pushbuffer thread,
+which is the limit again: remaining cost there is spread thin (method
+dispatch 11 %, raw batch build 6.5 %, walk 6-10 %, texture lookup 4.6 %,
+index conversion 4.5 %, driver calls ~6 %). Next candidates: x87 stack and
+MMX as locals (game thread), passing 16-bit triangle-list indices straight
+to Vulkan, a second executor stage (decode vs. command recording).
