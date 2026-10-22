@@ -487,6 +487,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    /* Freed contiguous memory goes back to the arena. The toolkit keeps it
+     * off by default; Ghost Recon 2 unloads each mission and loads the next
+     * (Replay, Load Campaign after the After Action Review), and without it
+     * the second load found the 64 MB arena full and the title put up "A
+     * problem has occurred. Please restart your Xbox." Set
+     * RECOMP_HEAP_RECLAIM=0 to get the old behaviour back (the toolkit only
+     * checks that the variable exists, so 0 clears it). */
+    if (!getenv("RECOMP_HEAP_RECLAIM"))
+        _putenv("RECOMP_HEAP_RECLAIM=1");
+    else if (strcmp(getenv("RECOMP_HEAP_RECLAIM"), "0") == 0)
+        _putenv("RECOMP_HEAP_RECLAIM=");
+
     printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
