@@ -188,6 +188,7 @@ static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
 static long long s_stat_wait;
 static unsigned s_stat_begins, s_stat_uploads;
 static unsigned s_stat_passes, s_stat_barriers, s_stat_copies, s_stat_draws;
+static uint64_t s_stat_hash_bytes;   /* texture bytes hashed for change checks */
 static double s_stat_gpu_ms;            /* GPU time of the submissions, by timestamps */
 static VkQueryPool s_qpool;
 
@@ -570,11 +571,30 @@ static uint64_t hash_bytes(const uint8_t *p, uint32_t n)
      * every frame (Ghost Recon 2's grade strip, 8 KB) can change in words
      * a sparse sample never reads, and a stale strip turned the graded
      * scene green. Large ones are sampled every 32 bytes. */
-    uint32_t step = n <= 65536u ? 4u : 32u;
-    for (i = 0; i + 4 <= n; i += step) {
-        h ^= *(const uint32_t *)(p + i);
-        h *= 1099511628211ull;
+    /* Four independent lanes: one serial multiply chain per dword was
+     * latency-bound, and the once-a-frame check covers ~7 MB of textures in
+     * Ghost Recon 2 play -- most of texture_view's time. Same coverage. */
+    uint64_t l0 = h, l1 = h ^ 1, l2 = h ^ 2, l3 = h ^ 3;
+    const uint64_t m = 1099511628211ull;
+    if (n <= 65536u) {
+        for (i = 0; i + 32 <= n; i += 32) {
+            const uint64_t *q = (const uint64_t *)(p + i);
+            l0 = (l0 ^ q[0]) * m; l1 = (l1 ^ q[1]) * m;
+            l2 = (l2 ^ q[2]) * m; l3 = (l3 ^ q[3]) * m;
+        }
+        for (; i + 4 <= n; i += 4)
+            l0 = (l0 ^ *(const uint32_t *)(p + i)) * m;
+    } else {
+        for (i = 0; i + 128 <= n; i += 128) {
+            l0 = (l0 ^ *(const uint32_t *)(p + i)) * m;
+            l1 = (l1 ^ *(const uint32_t *)(p + i + 32)) * m;
+            l2 = (l2 ^ *(const uint32_t *)(p + i + 64)) * m;
+            l3 = (l3 ^ *(const uint32_t *)(p + i + 96)) * m;
+        }
+        for (; i + 4 <= n; i += 32)
+            l0 = (l0 ^ *(const uint32_t *)(p + i)) * m;
     }
+    h = l0 ^ (l1 * 31) ^ (l2 * 961) ^ (l3 * 29791);
     return h ^ n;
 }
 
@@ -789,13 +809,27 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         return s->view;
     }
 
-    for (i = 0; i < B.ntex; i++)
-        if (B.tex[i].va == src->offset && B.tex[i].color == src->color
-            && B.tex[i].w == src->width && B.tex[i].h == src->height
-            && (st->normalised || B.tex[i].pitch == src->pitch)) {
-            t = &B.tex[i];
-            break;
-        }
+    {
+        /* A direct-mapped cache of the last entry found per address, checked
+         * field by field before use: the linear search over every texture,
+         * for every stage of every draw, was 8 % of the pushbuffer thread. */
+        static int cache[1024];
+        unsigned slot = ((src->offset >> 8) ^ (src->offset >> 18) ^ src->color) & 1023u;
+        int c = cache[slot] - 1;
+#define TEX_MATCHES(k) (B.tex[k].va == src->offset && B.tex[k].color == src->color \
+            && B.tex[k].w == src->width && B.tex[k].h == src->height \
+            && (st->normalised || B.tex[k].pitch == src->pitch))
+        if (c >= 0 && c < B.ntex && TEX_MATCHES(c))
+            t = &B.tex[c];
+        else
+            for (i = 0; i < B.ntex; i++)
+                if (TEX_MATCHES(i)) {
+                    t = &B.tex[i];
+                    cache[slot] = i + 1;
+                    break;
+                }
+#undef TEX_MATCHES
+    }
     /* Checked once a frame -- or on every use for a small texture that has
      * been seen to change: the title rewrites some within a frame (GR2's
      * colour-grade strip). Hashing every small texture on every use cost a
@@ -806,6 +840,7 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         return t->view;
     }
     h = hash_bytes(mem + src->offset, tex_bytes(src));
+    s_stat_hash_bytes += tex_bytes(src);
     if (t && t->img && t->hash != h)
         t->changes++;
     if (t && t->hash == h) {
@@ -2849,16 +2884,17 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                 QueryPerformanceFrequency(&fq);
                 fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures) | per frame: "
                         "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU, GPU busy %.2f ms, "
-                        "%.0f draws, %.0f passes, %.0f barriers, %.1f copies\n",
+                        "%.0f draws, %.0f passes, %.0f barriers, %.1f copies, %.0f KB hashed\n",
                         frames * 1000.0 / (now - t0), B.npipes, B.ntex,
                         (double)s_stat_begins / frames, (double)s_stat_uploads / frames,
                         (double)s_stat_wait * 1000.0 / fq.QuadPart / frames,
                         s_stat_gpu_ms / frames, (double)s_stat_draws / frames,
                         (double)s_stat_passes / frames, (double)s_stat_barriers / frames,
-                        (double)s_stat_copies / frames);
+                        (double)s_stat_copies / frames,
+                        (double)s_stat_hash_bytes / 1024.0 / frames);
                 s_stat_wait = 0; s_stat_begins = 0; s_stat_uploads = 0;
                 s_stat_gpu_ms = 0; s_stat_draws = 0; s_stat_passes = 0;
-                s_stat_barriers = 0; s_stat_copies = 0;
+                s_stat_barriers = 0; s_stat_copies = 0; s_stat_hash_bytes = 0;
                 frames = 0;
                 t0 = now;
             }
