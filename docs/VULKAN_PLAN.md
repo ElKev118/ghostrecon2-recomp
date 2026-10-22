@@ -151,6 +151,10 @@ on the modulate passes), RECOMP_VK_SHADOW=0|1.
 - Very distant trees / plains (far LOD, mostly in the opening cinematic sky
   line and a far plain in gameplay) look teal/cyan where Cxbx shows green.
   Probably another far-LOD pass (unsupported stage mode or a lookup).
+- After climbing a wall at the start (climb action, left stick) and raising
+  the weapon, the weapon / first-person model flickers as if drawn in two
+  positions (user, 2026-10-21; works otherwise). Possibly two frames of
+  different vertex-program constants, or a pass drawn twice.
 
 ## Performance notes from the user (next big phase)
 
