@@ -135,6 +135,13 @@ typedef struct {
     VkBuffer stage[64];
     VkDeviceMemory stage_mem[64];
     int nstage;
+    /* Texture staging, sub-allocated: a buffer and an allocation per upload
+     * (made here, freed at the frame's next begin) put two kernel round
+     * trips on every upload. Uploads too big for it still get their own. */
+    VkBuffer sring;
+    VkDeviceMemory sring_mem;
+    uint8_t *smap;
+    VkDeviceSize sused;
     int ts_valid;                   /* timestamps written in this submission */
 } Frame;
 
@@ -188,7 +195,10 @@ static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
 static long long s_stat_wait;
 static unsigned s_stat_begins, s_stat_uploads;
 static unsigned s_stat_passes, s_stat_barriers, s_stat_copies, s_stat_draws;
+/* Bumped at every vkCmdBeginRendering: draw_vertices re-records its state. */
+static uint32_t s_cmd_epoch;
 static uint64_t s_stat_hash_bytes;   /* texture bytes hashed for change checks */
+static uint64_t s_stat_vtx_bytes;    /* vertex + index bytes copied for draws */
 static double s_stat_gpu_ms;            /* GPU time of the submissions, by timestamps */
 static VkQueryPool s_qpool;
 
@@ -325,7 +335,9 @@ static void begin_frame(void)
         vkFreeMemory(B.dev, f->stage_mem[i], NULL);
     }
     f->nstage = 0;
+    f->sused = 0;
     f->vused = 0;
+    s_cmd_epoch++;                  /* command buffers cycle: state starts over */
     f->uused = 0;
     vkResetCommandBuffer(f->cmd, 0);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -537,6 +549,7 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
         ri.pStencilAttachment = &da;
     }
     vkCmdBeginRendering(cur()->cmd, &ri);
+    s_cmd_epoch++;
     s_stat_passes++;
     B.rendering = 1;
     B.rt_color = c;
@@ -607,19 +620,39 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
 {
     uint32_t *argb;
     VkBuffer sb;
-    VkDeviceMemory sm;
+    VkDeviceMemory sm = VK_NULL_HANDLE;
     void *map;
     Frame *f = cur();
     VkBufferImageCopy c;
+    VkDeviceSize soff = 0;
     size_t bytes = (size_t)src->width * src->height * 4;
+#define VKB_STAGE_RING (16u << 20)
 
-    if (f->nstage >= 64) {                     /* staging full: flush */
-        submit_frame();
+    if (!f->sring && !make_buffer(VKB_STAGE_RING, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  &f->sring, &f->sring_mem, (void **)&f->smap))
+        f->sring = VK_NULL_HANDLE;
+    if (f->sring && bytes <= VKB_STAGE_RING && f->sused + bytes > VKB_STAGE_RING) {
+        submit_frame();                        /* ring full: flush */
         begin_frame();
         f = cur();
+        if (!f->sring && !make_buffer(VKB_STAGE_RING, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                      &f->sring, &f->sring_mem, (void **)&f->smap))
+            f->sring = VK_NULL_HANDLE;
     }
-    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sb, &sm, &map))
-        return 0;
+    if (f->sring && f->sused + bytes <= VKB_STAGE_RING) {
+        sb = f->sring;
+        soff = f->sused;
+        map = f->smap + soff;
+        f->sused = (f->sused + bytes + 255u) & ~(VkDeviceSize)255u;
+    } else {
+        if (f->nstage >= 64) {                 /* staging full: flush */
+            submit_frame();
+            begin_frame();
+            f = cur();
+        }
+        if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sb, &sm, &map))
+            return 0;
+    }
     argb = (uint32_t *)map;
     s_stat_uploads++;
     {
@@ -656,8 +689,10 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
                     argb[0], argb[src->width * src->height / 2]);
         }
     }
-    f->stage[f->nstage] = sb;
-    f->stage_mem[f->nstage++] = sm;
+    if (sm) {                                  /* its own buffer: freed later */
+        f->stage[f->nstage] = sb;
+        f->stage_mem[f->nstage++] = sm;
+    }
 
     if (!t->img && !make_image(src->width, src->height, VK_FORMAT_B8G8R8A8_UNORM,
                                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -666,6 +701,7 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
     end_rendering();
     img_barrier(f->cmd, t->img, 0, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&c, 0, sizeof c);
+    c.bufferOffset = soff;
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     c.imageSubresource.layerCount = 1;
     c.imageExtent.width = src->width;
@@ -1728,6 +1764,85 @@ static int init(void)
 
 /* ---- Nv2aBackend ------------------------------------------------------ */
 
+/* Vertex streams already in this frame's buffer. The title draws the same
+ * geometry in several passes a frame (shadow maps, the scene, reflections):
+ * in Ghost Recon 2 play 24 MB of vertices a frame were copied for 4.5 MB of
+ * distinct streams. A copy is reused for the same (pointer, size) while the
+ * executor's data generation is unchanged (Nv2aBatchVsh.data_gen) and the
+ * frame's buffer is the one it was written to (B.frame_no). */
+#define VTX_REUSE_N 8192u
+static struct {
+    const uint8_t *data;
+    uint32_t bytes, gen, frame;
+    VkDeviceSize at;
+} s_vreuse[VTX_REUSE_N];
+
+static uint32_t vtx_reuse_slot(const uint8_t *data, uint32_t bytes)
+{
+    uint64_t k = (uint64_t)(uintptr_t)data ^ ((uint64_t)bytes << 40);
+    return (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 40) & (VTX_REUSE_N - 1u);
+}
+
+static int vtx_reuse_find(const uint8_t *data, uint32_t bytes, uint32_t gen,
+                          VkDeviceSize *at)
+{
+    uint32_t sl = vtx_reuse_slot(data, bytes), i;
+    for (i = 0; i < 8; i++, sl = (sl + 1) & (VTX_REUSE_N - 1u))
+        if (s_vreuse[sl].data == data && s_vreuse[sl].bytes == bytes
+            && s_vreuse[sl].gen == gen && s_vreuse[sl].frame == B.frame_no + 1u) {
+            *at = s_vreuse[sl].at;
+            return 1;
+        }
+    return 0;
+}
+
+static void vtx_reuse_add(const uint8_t *data, uint32_t bytes, uint32_t gen,
+                          VkDeviceSize at)
+{
+    uint32_t sl = vtx_reuse_slot(data, bytes), i, pick = sl;
+    for (i = 0; i < 8; i++, sl = (sl + 1) & (VTX_REUSE_N - 1u))
+        if (s_vreuse[sl].frame != B.frame_no + 1u || s_vreuse[sl].gen != gen) {
+            pick = sl;
+            break;
+        }
+    s_vreuse[pick].data = data;
+    s_vreuse[pick].bytes = bytes;
+    s_vreuse[pick].gen = gen;
+    s_vreuse[pick].frame = B.frame_no + 1u;
+    s_vreuse[pick].at = at;
+}
+
+/* What the current command buffer already has bound, so a draw records only
+ * what changed. About a third of the pushbuffer thread was the driver taking
+ * the same viewport, scissor, pipeline and descriptors ~1700 times a frame.
+ * `cmd` and `epoch` key it: a new command buffer or rendering pass (see
+ * begin_rendering's s_cmd_epoch++) starts it over. The uniform blocks are
+ * kept per frame buffer instead (`frame`): identical contents reuse the
+ * previous copy, which is also what lets the descriptors stay as they are. */
+static struct {
+    VkCommandBuffer cmd;
+    uint32_t epoch;
+    VkPipeline pipe;
+    int have_desc, have_pc, have_dyn, have_vb, have_ib;
+    VkDescriptorImageInfo ii[4];
+    VkDeviceSize ubo_off, vsh_off;
+    int vsh;
+    PushConsts pc;
+    VkViewport vp;
+    VkRect2D sc;
+    uint32_t blend_color, stencil_ref;
+    uint32_t nvb;
+    VkDeviceSize vb_off[16];
+    VkDeviceSize ib_off;
+} s_cs;
+static struct {
+    uint32_t frame;                  /* B.frame_no + 1 when valid */
+    VkDeviceSize ubo_off, vsh_off;
+    int have_ubo, have_vsh;
+    RcUbo ubo;
+    uint8_t vsh[192 * 16 + 16 + 256];
+} s_ucache;
+
 static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                           const Nv2aVertexXf *v, uint32_t count,
                           const Nv2aTexStage *stages, float zmax,
@@ -1747,7 +1862,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     PushConsts pc;
     VkViewport vp;
     VkRect2D sc;
-    VkDeviceSize off;
+    VkDeviceSize off, ioff = 0, soff[16];
     /* draw_vsh: program inputs then the index list; else transformed
      * vertices. Debug output below reads v[0]: a zero vertex then. */
     static const Nv2aVertexXf zero_v;
@@ -1804,6 +1919,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     B.next_zeta = rs->zeta_va ? va_key(rs->zeta_va) : 0;
     B.next_target_w = sf->pitch / (sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
     if (B.next_target_w < sf->width) B.next_target_w = sf->width;
+    memset(ii, 0, sizeof ii);                  /* compared whole, padding too */
     for (st = 0; st < 4; st++) {
         VkImageView view;
         s_view_w = s_view_h = 0;
@@ -1956,17 +2072,32 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     if (rawb) {
         uint32_t k, at = 0;
         for (k = 0; k < rawb->nstreams; k++) {
-            memcpy(f->vmap + f->vused + at, rawb->stream[k].data, rawb->stream[k].bytes);
-            at += (rawb->stream[k].bytes + 255u) & ~255u;
+            const uint8_t *src = rawb->stream[k].data;
+            uint32_t n = rawb->stream[k].bytes;
+            if (rawb->data_gen && vtx_reuse_find(src, n, rawb->data_gen, &soff[k]))
+                continue;                      /* already in this frame's buffer */
+            memcpy(f->vmap + off + at, src, n);
+            soff[k] = off + at;
+            if (rawb->data_gen)
+                vtx_reuse_add(src, n, rawb->data_gen, soff[k]);
+            s_stat_vtx_bytes += n;
+            at += (n + 255u) & ~255u;
         }
-        memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
-    } else if (s_vsh) {
-        memcpy(f->vmap + f->vused, s_vsh->inputs, vbytes);
-        memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
+        ioff = off + at;
+        memcpy(f->vmap + ioff, s_vsh->indices, ibytes);
+        s_stat_vtx_bytes += ibytes;
+        f->vused = off + ((at + ibytes + 255u) & ~255u);
     } else {
-        memcpy(f->vmap + f->vused, v, vbytes);
+        if (s_vsh) {
+            memcpy(f->vmap + f->vused, s_vsh->inputs, vbytes);
+            memcpy(f->vmap + f->vused + ((vbytes + 255u) & ~255u), s_vsh->indices, ibytes);
+            ioff = off + ((vbytes + 255u) & ~255u);
+        } else {
+            memcpy(f->vmap + f->vused, v, vbytes);
+        }
+        f->vused += (bytes + 255u) & ~255u;
+        s_stat_vtx_bytes += bytes;
     }
-    f->vused += (bytes + 255u) & ~255u;
 
     memset(&ubo, 0, sizeof ubo);
     uint32_t px_state_sp = px ? px->stage_program : 0, px_state_ctl = px ? px->control : 0;
@@ -2019,22 +2150,45 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         ubo.shadow[2] = (uint32_t)force;
     }
     memcpy(ubo.shadowmax, shadow_max, sizeof shadow_max);
-    memcpy(f->umap + f->uused, &ubo, sizeof ubo);
+    if (s_ucache.frame != B.frame_no + 1u) {
+        s_ucache.frame = B.frame_no + 1u;
+        s_ucache.have_ubo = s_ucache.have_vsh = 0;
+    }
     ubi.buffer = f->ubuf;
-    ubi.offset = f->uused;
     ubi.range = sizeof ubo;
-    f->uused += 512u;    /* sizeof(RcUbo) <= 512, offset alignment */
+    if (s_ucache.have_ubo && !memcmp(&s_ucache.ubo, &ubo, sizeof ubo)) {
+        ubi.offset = s_ucache.ubo_off;
+    } else {
+        memcpy(f->umap + f->uused, &ubo, sizeof ubo);
+        ubi.offset = f->uused;
+        f->uused += 512u;    /* sizeof(RcUbo) <= 512, offset alignment */
+        s_ucache.ubo = ubo;
+        s_ucache.ubo_off = ubi.offset;
+        s_ucache.have_ubo = 1;
+    }
     if (s_vsh) {
-        /* c[0..191] then the anti-aliasing scale (std140: vec4s). */
+        /* c[0..191] then the anti-aliasing scale (std140: vec4s), then the
+         * immediate attributes of a raw batch. */
+        static uint8_t blk[192 * 16 + 16 + 256];
         float aa[4] = { s_vsh->aa[0], s_vsh->aa[1], 0.0f, 0.0f };
-        memcpy(f->umap + f->uused, s_vsh->constants, 192 * 16);
-        memcpy(f->umap + f->uused + 192 * 16, aa, sizeof aa);
+        memcpy(blk, s_vsh->constants, 192 * 16);
+        memcpy(blk + 192 * 16, aa, sizeof aa);
         if (rawb)
-            memcpy(f->umap + f->uused + 192 * 16 + 16, rawb->imm, sizeof rawb->imm);
+            memcpy(blk + 192 * 16 + 16, rawb->imm, sizeof rawb->imm);
+        else
+            memset(blk + 192 * 16 + 16, 0, 256);
         vbi.buffer = f->ubuf;
-        vbi.offset = f->uused;
-        vbi.range = 192 * 16 + 16 + 256;
-        f->uused += VSH_UBO_BYTES;
+        vbi.range = sizeof blk;
+        if (s_ucache.have_vsh && !memcmp(s_ucache.vsh, blk, sizeof blk)) {
+            vbi.offset = s_ucache.vsh_off;
+        } else {
+            memcpy(f->umap + f->uused, blk, sizeof blk);
+            vbi.offset = f->uused;
+            f->uused += VSH_UBO_BYTES;
+            memcpy(s_ucache.vsh, blk, sizeof blk);
+            s_ucache.vsh_off = vbi.offset;
+            s_ucache.have_vsh = 1;
+        }
     }
 
     pc.surf[0] = (float)sf->pitch / (float)(sf->bytes_per_pixel ? sf->bytes_per_pixel : 4);
@@ -2071,33 +2225,50 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             pc.alpha[3] = 0;
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    w.dstBinding = 0;
-    w.descriptorCount = 4;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = ii;
-    w2[0] = w;
-    memset(&w2[1], 0, sizeof w2[1]);
-    w2[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w2[1].dstBinding = 1;
-    w2[1].descriptorCount = 1;
-    w2[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    w2[1].pBufferInfo = &ubi;
-    if (s_vsh) {
-        w2[2] = w2[1];
-        w2[2].dstBinding = 2;
-        w2[2].pBufferInfo = &vbi;
+    if (s_cs.cmd != cmd || s_cs.epoch != s_cmd_epoch) {
+        memset(&s_cs, 0, sizeof s_cs);
+        s_cs.cmd = cmd;
+        s_cs.epoch = s_cmd_epoch;
     }
-    pfnPushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, s_vsh ? 3 : 2, w2);
-    vkCmdPushConstants(cmd, B.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, sizeof pc, &pc);
-    vp.x = 0;
-    vp.y = 0;
+    if (s_cs.pipe != pipe) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        s_cs.pipe = pipe;
+    }
+    if (!s_cs.have_desc || memcmp(s_cs.ii, ii, sizeof ii) || s_cs.ubo_off != ubi.offset
+        || s_cs.vsh != (s_vsh != NULL) || (s_vsh && s_cs.vsh_off != vbi.offset)) {
+        w.dstBinding = 0;
+        w.descriptorCount = 4;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = ii;
+        w2[0] = w;
+        memset(&w2[1], 0, sizeof w2[1]);
+        w2[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w2[1].dstBinding = 1;
+        w2[1].descriptorCount = 1;
+        w2[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w2[1].pBufferInfo = &ubi;
+        if (s_vsh) {
+            w2[2] = w2[1];
+            w2[2].dstBinding = 2;
+            w2[2].pBufferInfo = &vbi;
+        }
+        pfnPushDescriptor(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, B.layout, 0, s_vsh ? 3 : 2, w2);
+        memcpy(s_cs.ii, ii, sizeof ii);
+        s_cs.ubo_off = ubi.offset;
+        s_cs.vsh = s_vsh != NULL;
+        s_cs.vsh_off = s_vsh ? vbi.offset : 0;
+        s_cs.have_desc = 1;
+    }
+    if (!s_cs.have_pc || memcmp(&s_cs.pc, &pc, sizeof pc)) {
+        vkCmdPushConstants(cmd, B.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof pc, &pc);
+        s_cs.pc = pc;
+        s_cs.have_pc = 1;
+    }
+    memset(&vp, 0, sizeof vp);
     vp.width = (float)B.rt_color->w;
     vp.height = (float)B.rt_color->h;
-    vp.minDepth = 0.0f;
     vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
     /* Scissor = the surface clip box, origin included (xemu draw.c). */
     {
         uint32_t x0 = sf->clip_x < B.rt_color->w ? sf->clip_x : B.rt_color->w;
@@ -2117,32 +2288,50 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (tiny < 0) tiny = getenv("RECOMP_VK_TINY") != NULL;
         if (tiny) { sc.extent.width = sc.extent.width ? 1 : 0; sc.extent.height = sc.extent.height ? 1 : 0; }
     }
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-    {
+    if (!s_cs.have_dyn || memcmp(&s_cs.vp, &vp, sizeof vp)) {
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        s_cs.vp = vp;
+    }
+    if (!s_cs.have_dyn || memcmp(&s_cs.sc, &sc, sizeof sc)) {
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        s_cs.sc = sc;
+    }
+    if (!s_cs.have_dyn || s_cs.blend_color != rs->blend_color) {
         float bc[4] = { ((rs->blend_color >> 16) & 0xFF) / 255.0f,
                         ((rs->blend_color >> 8) & 0xFF) / 255.0f,
                         (rs->blend_color & 0xFF) / 255.0f,
                         ((rs->blend_color >> 24) & 0xFF) / 255.0f };
         vkCmdSetBlendConstants(cmd, bc);
+        s_cs.blend_color = rs->blend_color;
     }
-    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, rs->stencil_ref & 0xFF);
+    if (!s_cs.have_dyn || s_cs.stencil_ref != (rs->stencil_ref & 0xFF)) {
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, rs->stencil_ref & 0xFF);
+        s_cs.stencil_ref = rs->stencil_ref & 0xFF;
+    }
+    s_cs.have_dyn = 1;
     if (rawb) {
         VkBuffer bufs[16];
-        VkDeviceSize offs[16];
-        uint32_t k, at = 0;
-        for (k = 0; k < rawb->nstreams; k++) {
+        uint32_t k;
+        for (k = 0; k < rawb->nstreams; k++)
             bufs[k] = f->vbuf;
-            offs[k] = off + at;
-            at += (rawb->stream[k].bytes + 255u) & ~255u;
+        if (rawb->nstreams && (!s_cs.have_vb || s_cs.nvb != rawb->nstreams
+                               || memcmp(s_cs.vb_off, soff, rawb->nstreams * sizeof soff[0]))) {
+            vkCmdBindVertexBuffers(cmd, 0, rawb->nstreams, bufs, soff);
+            s_cs.nvb = rawb->nstreams;
+            memcpy(s_cs.vb_off, soff, rawb->nstreams * sizeof soff[0]);
+            s_cs.have_vb = 1;
         }
-        if (rawb->nstreams)
-            vkCmdBindVertexBuffers(cmd, 0, rawb->nstreams, bufs, offs);
     } else {
         vkCmdBindVertexBuffers(cmd, 0, 1, &f->vbuf, &off);
+        s_cs.have_vb = 0;
     }
     s_stat_draws++;
     if (s_vsh) {
-        vkCmdBindIndexBuffer(cmd, f->vbuf, off + ((vbytes + 255u) & ~255u), VK_INDEX_TYPE_UINT32);
+        if (!s_cs.have_ib || s_cs.ib_off != ioff) {
+            vkCmdBindIndexBuffer(cmd, f->vbuf, ioff, VK_INDEX_TYPE_UINT32);
+            s_cs.ib_off = ioff;
+            s_cs.have_ib = 1;
+        }
         vkCmdDrawIndexed(cmd, s_vsh->nindices, 1, 0, 0, 0);
     } else {
         vkCmdDraw(cmd, count, 1, 0, 0);
@@ -2881,20 +3070,40 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
             if (!t0) t0 = now;
             if (now - t0 >= 5000) {
                 LARGE_INTEGER fq;
+                /* CPU time of this (the pushbuffer) thread over the window:
+                 * busy versus waiting for work, which the sampler cannot
+                 * tell apart inside the driver. */
+                static ULONGLONG cpu0;
+                FILETIME ct, et, kt, ut;
+                ULONGLONG cpu = 0;
+                if (GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut))
+                    cpu = (((ULONGLONG)kt.dwHighDateTime << 32) | kt.dwLowDateTime)
+                        + (((ULONGLONG)ut.dwHighDateTime << 32) | ut.dwLowDateTime);
+                extern long long nv2a_pb_busy_ticks(void);
+                static long long busy0;
+                long long busy = nv2a_pb_busy_ticks();
                 QueryPerformanceFrequency(&fq);
+                fprintf(stderr, "[VKB] pushbuffer thread: CPU %.0f%%, executing %.0f%% = %.2f ms a frame\n",
+                        cpu0 ? (double)(cpu - cpu0) / 10000.0 / (now - t0) * 100.0 : 0.0,
+                        busy0 ? (double)(busy - busy0) * 1000.0 / fq.QuadPart / (now - t0) * 100.0 : 0.0,
+                        busy0 ? (double)(busy - busy0) * 1000.0 / fq.QuadPart / frames : 0.0);
+                cpu0 = cpu;
+                busy0 = busy;
                 fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures) | per frame: "
                         "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU, GPU busy %.2f ms, "
-                        "%.0f draws, %.0f passes, %.0f barriers, %.1f copies, %.0f KB hashed\n",
+                        "%.0f draws, %.0f passes, %.0f barriers, %.1f copies, %.0f KB hashed, %.0f KB vertices copied\n",
                         frames * 1000.0 / (now - t0), B.npipes, B.ntex,
                         (double)s_stat_begins / frames, (double)s_stat_uploads / frames,
                         (double)s_stat_wait * 1000.0 / fq.QuadPart / frames,
                         s_stat_gpu_ms / frames, (double)s_stat_draws / frames,
                         (double)s_stat_passes / frames, (double)s_stat_barriers / frames,
                         (double)s_stat_copies / frames,
-                        (double)s_stat_hash_bytes / 1024.0 / frames);
+                        (double)s_stat_hash_bytes / 1024.0 / frames,
+                        (double)s_stat_vtx_bytes / 1024.0 / frames);
                 s_stat_wait = 0; s_stat_begins = 0; s_stat_uploads = 0;
                 s_stat_gpu_ms = 0; s_stat_draws = 0; s_stat_passes = 0;
                 s_stat_barriers = 0; s_stat_copies = 0; s_stat_hash_bytes = 0;
+                s_stat_vtx_bytes = 0;
                 frames = 0;
                 t0 = now;
             }

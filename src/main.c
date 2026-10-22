@@ -359,19 +359,39 @@ static DWORD WINAPI sampler_thread(LPVOID arg)
         memset(&ctx, 0, sizeof(ctx));
         ctx.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(s_sample_target, &ctx)) {
-            rip0 = ctx.Rip;                    /* StackWalk64 rewrites ctx */
-            memset(&sf, 0, sizeof(sf));
-            sf.AddrPC.Offset = ctx.Rip;    sf.AddrPC.Mode = AddrModeFlat;
-            sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
-            sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+            rip0 = ctx.Rip;
+            (void)sf; (void)proc;
             memset(rec, 0, sizeof(rec));
-            while (depth < 8 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc,
-                                            s_sample_target, &sf, &ctx, NULL,
-                                            SymFunctionTableAccess64,
-                                            SymGetModuleBase64, NULL)) {
-                uintptr_t pc = (uintptr_t)sf.AddrPC.Offset;
-                rec[depth++] = pc >= base && pc - base < 0x80000000u
-                             ? (uint32_t)(pc - base) : 0xFFFFFFFFu;
+            /* The innermost frame as it is, then only frames of the
+             * executable: a driver call is often deeper than eight frames,
+             * and recording its own frames named nothing of ours. Unwound
+             * with the system's own unwinder: StackWalk64 only knew the
+             * modules loaded when dbghelp started, so it lost its way in
+             * the Vulkan driver and returned junk. */
+            __try {
+                int walked = 0;
+                while (depth < 8 && walked++ < 64 && ctx.Rip) {
+                    uintptr_t pc = (uintptr_t)ctx.Rip;
+                    int in_exe = pc >= base && pc - base < 0x80000000u;
+                    DWORD64 img = 0, frame = 0;
+                    PRUNTIME_FUNCTION fn;
+                    PVOID hd = NULL;
+                    if (!depth || in_exe)
+                        rec[depth++] = in_exe ? (uint32_t)(pc - base) : 0xFFFFFFFFu;
+                    fn = RtlLookupFunctionEntry(ctx.Rip, &img, NULL);
+                    if (fn) {
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, ctx.Rip, fn, &ctx,
+                                         &hd, &frame, NULL);
+                    } else {                       /* leaf: return address at rsp */
+                        if (!ctx.Rsp)
+                            break;
+                        ctx.Rip = *(DWORD64 *)(uintptr_t)ctx.Rsp;
+                        ctx.Rsp += 8;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                /* a frame with no unwind data led off the stack: keep what
+                 * was recorded */
             }
         }
         ResumeThread(s_sample_target);
