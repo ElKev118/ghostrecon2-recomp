@@ -20,6 +20,8 @@ set RECOMP_VBLANK=1
 set RECOMP_TRACE_BUDGET=0
 rem Objetivo del limitador de fotogramas del juego en ms (33 = original, 16.667 = 60 FPS, 0 = sin limite)
 set RECOMP_GR2_FRAME_MS=16.667
+rem Un hilo contesta al instante los avisos de envio a la GPU (usa un nucleo, ~+10% FPS)
+set RECOMP_NV2A_KICK_SPIN=1
 ghostrecon2.exe > run_60.log 2>&1
 echo Exit code: %ERRORLEVEL%  (log: %CD%\run_60.log)
 pause
