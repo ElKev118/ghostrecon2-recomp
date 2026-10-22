@@ -521,6 +521,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
+    /* 128 MB of guest address space over the console's 64 MB of RAM. The
+     * title still sees 64 MB; only the heap's room grows. On the console
+     * NtAllocateVirtualMemory backs a request with pages from anywhere, here
+     * a block needs one unbroken run, and after a few mission loads (menu ->
+     * mission -> menu -> training) the 50 MB heap had 13.5 MB free with no
+     * 5.2 MB piece: "A problem has occurred. Please restart your Xbox." */
+    {
+        extern void xbox_SetMapSize(size_t bytes);
+        xbox_SetMapSize(128u * 1024 * 1024);
+    }
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
                     "The required virtual address range may be unavailable.",
