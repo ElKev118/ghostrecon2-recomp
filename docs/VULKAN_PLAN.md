@@ -308,3 +308,12 @@ RECOMP_TRACE_TIMES=4C039E,4C31BD (timed calls, APU clock).
   between sub_004C039E and the next read), compare with xemu (also lags);
   check whether reads should be asynchronous (file opened without
   SYNCHRONOUS_IO, opts 0x48; we complete them inline).
+- ROOT CAUSE (fixed, toolkit 32968de): the player shows each frame when
+  D3D's vblank count ([device+0x1DE8], via GetDisplayFieldStatus
+  sub_0042C3C0) reaches (anchor + timestamp) / 16.683 ms. That count ran at
+  30 Hz: D3D's DPC (sub_00435EC0) re-reads PMC_INTR_0 and counts the vblank
+  (sub_00435710) only if the PCRTC bit is still set, and the NV2A ack thread
+  (KICK_SPIN) zeroed it between the ISR and the DPC about every other time.
+  Video ran at half speed against the audio, hence the doubling. The tick now
+  holds those bits until the DPC has run: 60 counts/s, the logo plays 10 s
+  with no dry-out. Check with RECOMP_VBLANK_PROBE=0x43A1B8 (raised vs dev).
