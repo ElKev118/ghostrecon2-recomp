@@ -280,3 +280,31 @@ to Vulkan, a second executor stage (decode vs. command recording).
   volatile guest memory accesses).
   OPTIONAL, for the end: only if raising the resolution costs notable FPS
   (user, 2026-10-22).
+
+## XMV movie stutter -- findings (2026-10-22)
+
+Test: logoubi.xmv (restore from build/Release/video_disabled_boot/ to
+game/video/), tools/video_run.sh, RECOMP_APU_STREAM_TRACE=1,
+RECOMP_TRACE_TIMES=4C039E,4C31BD (timed calls, APU clock).
+
+- Symptom: audio packets come later and later (gaps doubling: 904, 2024,
+  3968, 7888, 16384 VP frames); the APU completes every packet on time.
+- Fixed on the way: USB HccaFrameNumber ran at 78 % (DirectSound uses it as
+  its ms reference to trim the APU rate, sub_0050C7E0). Now 1/ms real time.
+- The player (XMV section 0x4BFF40..): update sub_004C056E ~3000x/s; its
+  video clock is the performance counter (sub_004C0BEB), re-anchored to the
+  audio at every packet completion: sub_004C039E(player, audio_ms, 0).
+  Frames decode in sub_004C31BD(.., timestamp_ms, ..) ~20 ms late. The next
+  file block is read when the video reaches the end of the current one,
+  and its audio is queued right away: only one packet of audio lead.
+- The spiral: a completion arriving late re-anchors the video back, the
+  next read is later, the stream runs dry; while dry no completion comes,
+  the clock falls further back and the wait doubles.
+- NOT the cause: GPU (0.17 ms a frame in the movie), decode CPU (2.4 % of
+  the main thread), DPC/ISR latency (DirectSound handles a completion in
+  ~5 ms), the 30 FPS limiter, the APU output lead (4096..16384 samples
+  queued changed nothing).
+- Next: find what makes each completion -> read take ~160 ms (which wait
+  between sub_004C039E and the next read), compare with xemu (also lags);
+  check whether reads should be asynchronous (file opened without
+  SYNCHRONOUS_IO, opts 0x48; we complete them inline).
