@@ -154,7 +154,22 @@ on the modulate passes), RECOMP_VK_SHADOW=0|1.
 
 ## Performance notes from the user (next big phase)
 
-- Target: >= 60 FPS in gameplay and smooth cinematics. Now 6-18 FPS.
+- Target: >= 60 FPS in gameplay and smooth cinematics. Was 6-18 FPS.
+- 2026-10-21 result: the title's own limiter (0x0007E19D sleeps to
+  *(float*)0x57BF1C = 33 ms) held play at 30. RECOMP_GR2_FRAME_MS overrides
+  it; the user verified 60 and unlimited run at correct game speed, with
+  cinematics in sync (the title is variable-timestep). Unlimited on the 5700G:
+  80-120 FPS in play (user's run), ~53 in the automated forest view.
+- What it took: GPU vertex programs + raw vertex buffers, generated fragment
+  shaders (GPU 66 -> 3 ms/frame), 60 Hz vblank, no per-draw getenv, bulk
+  pushbuffer parameter runs, kickoff answered by its own thread
+  (RECOMP_NV2A_KICK_SPIN=1). Launcher: run_gr2_sinlimite.bat.
+- Now the ceiling is the title's main thread: ~95 % game logic in generated
+  code (top: sub_0026CE80 render setup 12 %). Next lever is recompiler code
+  quality (see "Recompiler output" below), not more threads -- the guest
+  logic is single-threaded by design.
+- Crash fixed: timer DPC (DirectSound, sub_0050CDFA) ran beside the game
+  thread at DISPATCH_LEVEL; now gated (xbox_DpcBegin/End).
 - Cxbx-Reloaded runs GR2 much faster than xemu (but breaks at high internal
   resolution: black ground patch, exploding vertices). Worth studying how it
   avoids per-vertex CPU cost (it uses host vertex shaders).
@@ -186,12 +201,45 @@ Recommendation: SSAA + SMAA + RCAS, selectable in ghostrecon2.ini.
 
 If GR2 ships well, Ghost Recon 2: Summit Strike follows, reusing all of this.
 
+What carries over and what does not:
+- Toolkit (xboxrecomp, branch gr2-port): kernel, NV2A executor, GPU vertex
+  programs, DPC gate, vblank, pushbuffer speedups, APU, USB -- all generic.
+- In this repo, to share (move to the toolkit or a common dir): the Vulkan
+  back end (src/port/vk_backend.c, vk_psh_gen.c, vk_window.c).
+- Title-specific, to re-find by address in the new XBE (same engine, but a
+  different build moves every function): D3D_BlockOnTime replacement
+  (0x0042F970 here), the frame limiter target (0x57BF1C), D3D device pointer,
+  seed/manual function lists.
+
 ## Pre-rendered video (XMV) stutter -- user notes
 
 - Menu background video: smooth, no pauses.
+- Not a frame-rate problem: cinematics run at high FPS and the intro still
+  pauses (2026-10-21). Likely the movie player / DVD streaming path.
+- Plan (user): first restore the Ubisoft logo video (currently skipped) and
+  make it play without pauses, then the intro. The menu video is the
+  reference that already works -- compare what differs (file size/bitrate,
+  read pattern, audio stream).
 - Intro video: pauses audio+video together for ms..seconds. (The Ubisoft
   logo video is skipped; in xemu it also lags a lot.)
 - In-engine cinematics stall because the game thread waits on GPU fences
   (84% of its time in D3D_BlockOnTime while the pb thread runs vertex
   programs on the CPU). To re-measure after GPU vertex programs; the intro
   XMV needs its own profile (decode / DVD streaming / VBlank pacing).
+
+## Recompiler output (next performance lever)
+
+Disassembly of the hottest game function (sub_0026CE80, 12 % of the main
+thread) shows the cost: every guest register is a thread-local global
+(g_eax, g_esp, ...), so each x86 instruction becomes a read-modify-write of
+TLS memory, the TLS base is reloaded after every store, and
+g_xbox_mem_offset is reloaded on every memory access (MEMx are volatile).
+Roughly 3-4 host instructions of overhead per guest instruction.
+
+Plan: the recompiler keeps registers in C locals inside each function
+(loaded at entry, written back before calls / returns / indirect calls /
+kernel bridges, reloaded after), and holds the memory base in a local.
+Volatile stays only where the title polls memory (spin loops on MMIO /
+shared flags). Expected: large gain on the main thread (estimate 1.5-2x),
+benefits every title. Needs a full regen + build (~45 min) and careful
+validation (SEH unwinding, ABI checks, the fpdiff/c_fixture tests).
