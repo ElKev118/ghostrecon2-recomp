@@ -499,6 +499,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     else if (strcmp(getenv("RECOMP_HEAP_RECLAIM"), "0") == 0)
         _putenv("RECOMP_HEAP_RECLAIM=");
 
+    /* gr2.ini, the port menu's settings: before anything reads them. */
+    {
+        extern void port_settings_startup(void);
+        port_settings_startup();
+    }
+
     printf("=== YOUR_GAME_NAME - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 

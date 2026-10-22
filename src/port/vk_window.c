@@ -21,6 +21,7 @@
  *   RECOMP_WINDOW_SCALE=<n>    initial size n x 640x480 (default 2)
  *   RECOMP_PRESENT_VSYNC=0     present without waiting for the display
  *   F11 / Alt+Enter            toggle borderless fullscreen
+ *   Delete / Home              the port options menu (port_menu.cpp)
  */
 
 #include <stdint.h>
@@ -35,6 +36,8 @@
 #include "video_player.h"   /* xbox_FramebufferSetPresentHook */
 #include "keyboard_sdl.h"   /* xbox_InputSdlEvent */
 #include "vk_ctx.h"
+#include "port_menu.h"
+#include "port_settings.h"
 
 #define VKW_MAX_IMAGES 8
 
@@ -52,6 +55,7 @@ static struct {
     VkExtent2D       swap_ext;
     uint32_t         swap_count;
     VkImage          swap_img[VKW_MAX_IMAGES];
+    VkImageView      swap_view[VKW_MAX_IMAGES];  /* the menu renders into these */
     int              swap_dirty;
 
     /* The guest frame: a host-visible staging buffer and the image it is
@@ -238,8 +242,7 @@ static int create_swapchain(void)
     uint32_t n_fmt = 32, n_mode = 8, i;
     VkSwapchainCreateInfoKHR sci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
     VkSwapchainKHR old = V.swap;
-    const char *vs = getenv("RECOMP_PRESENT_VSYNC");
-    int vsync = !(vs && vs[0] == '0');
+    int vsync = port_settings()->vsync;
     int w, h;
 
     vkDeviceWaitIdle(V.dev);
@@ -293,6 +296,22 @@ static int create_swapchain(void)
 
     V.swap_count = VKW_MAX_IMAGES;
     vkGetSwapchainImagesKHR(V.dev, V.swap, &V.swap_count, V.swap_img);
+    for (i = 0; i < VKW_MAX_IMAGES; i++) {
+        if (V.swap_view[i])
+            vkDestroyImageView(V.dev, V.swap_view[i], NULL);
+        V.swap_view[i] = VK_NULL_HANDLE;
+    }
+    for (i = 0; i < V.swap_count; i++) {
+        VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = V.swap_img[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = V.swap_fmt;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        VKCHECK(vkCreateImageView(V.dev, &vci, NULL, &V.swap_view[i]), "swapchain view");
+    }
+    pmenu_set_image_count(V.swap_count);
     V.swap_dirty = 0;
     return 1;
 }
@@ -385,7 +404,8 @@ static int present(int upload)
     VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT
+                                    | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
     if (V.swap_dirty && !create_swapchain())
         return 0;
@@ -473,10 +493,29 @@ static int present(int upload)
                        1, &b, VK_FILTER_LINEAR);
     }
 
-    barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if (pmenu_is_open()) {
+        /* The options overlay, drawn over the frame. Under the queue lock:
+         * ImGui uploads its font atlas with a submit of its own. */
+        barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        vkw_queue_lock();
+        pmenu_draw(V.cmd, V.swap_view[idx], V.swap_ext.width, V.swap_ext.height);
+        vkw_queue_unlock();
+        barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    } else {
+        barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
     vkEndCommandBuffer(V.cmd);
 
     si.waitSemaphoreCount = 1;
@@ -532,6 +571,28 @@ static void on_flip(const uint32_t *xrgb, uint32_t w, uint32_t h)
 
 /* ---- window thread ---------------------------------------------------- */
 
+/* PS_WINDOWED / PS_BORDERLESS / PS_FULLSCREEN. Exclusive fullscreen takes
+ * the desktop's own mode, so the display does not switch resolution. */
+static void set_window_mode(int mode)
+{
+    if (mode == PS_FULLSCREEN) {
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(V.win), &dm) == 0)
+            SDL_SetWindowDisplayMode(V.win, &dm);
+        SDL_SetWindowFullscreen(V.win, SDL_WINDOW_FULLSCREEN);
+    } else {
+        SDL_SetWindowFullscreen(V.win, mode == PS_BORDERLESS
+                                ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    }
+    V.swap_dirty = 1;
+}
+
+static void set_vsync(int on)
+{
+    (void)on;                  /* create_swapchain reads port_settings() */
+    V.swap_dirty = 1;
+}
+
 static int window_thread(void *unused)
 {
     const char *sc = getenv("RECOMP_WINDOW_SCALE");
@@ -561,6 +622,25 @@ static int window_thread(void *unused)
     }
     fprintf(stderr, "[VKW] window up: %ux%u, swapchain %u images\n",
             V.swap_ext.width, V.swap_ext.height, V.swap_count);
+    {
+        PortMenuInit mi;
+        memset(&mi, 0, sizeof mi);
+        mi.win = V.win;
+        mi.inst = V.inst;
+        mi.phys = V.phys;
+        mi.dev = V.dev;
+        mi.qfam = V.qfam;
+        mi.queue = V.queue;
+        mi.format = V.swap_fmt;
+        mi.image_count = V.swap_count;
+        mi.set_window_mode = set_window_mode;
+        mi.set_vsync = set_vsync;
+        if (!pmenu_init(&mi))
+            fprintf(stderr, "[VKW] options menu unavailable\n");
+    }
+    fullscreen = port_settings()->window_mode != PS_WINDOWED;
+    if (fullscreen)
+        set_window_mode(port_settings()->window_mode);
     xbox_FramebufferSetPresentHook(on_flip);
     s_ready = 1;
 
@@ -569,6 +649,8 @@ static int window_thread(void *unused)
         int upload = 0;
 
         while (SDL_PollEvent(&ev)) {
+            if (pmenu_event(&ev))
+                continue;             /* the options menu's, not the game's */
             if (ev.type == SDL_QUIT) {
                 /* Lifted code cannot be stopped mid-flight; closing the
                  * window ends the process, as the user expects. */
@@ -581,8 +663,8 @@ static int window_thread(void *unused)
                     || (ev.key.keysym.sym == SDLK_RETURN
                         && (ev.key.keysym.mod & KMOD_ALT)))) {
                 fullscreen = !fullscreen;
-                SDL_SetWindowFullscreen(V.win, fullscreen
-                                        ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                port_settings()->window_mode = fullscreen ? PS_BORDERLESS : PS_WINDOWED;
+                set_window_mode(port_settings()->window_mode);
                 continue;
             }
             if (ev.type == SDL_WINDOWEVENT
@@ -607,6 +689,17 @@ static int window_thread(void *unused)
         if (upload || V.swap_dirty || s_gpu_frames != s_gpu_shown) {
             if (!present(upload))
                 break;
+        } else if (pmenu_is_open()) {
+            /* The menu animates and answers the mouse even when the game
+             * shows no new frame (loading, paused): redraw it at ~60 Hz. */
+            static Uint32 last_menu;
+            if (SDL_GetTicks() - last_menu >= 16) {
+                last_menu = SDL_GetTicks();
+                if (!present(0))
+                    break;
+            } else {
+                SDL_Delay(2);
+            }
         } else {
             SDL_Delay(2);
         }

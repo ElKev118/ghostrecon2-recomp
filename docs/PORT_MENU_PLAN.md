@@ -44,3 +44,17 @@ Implementation order:
 5. Language + restart.
 
 Future (step 3): FSR / SMAA toggles and quality presets in the same menu.
+
+## Status (2026-10-22)
+
+Done: ImGui v1.93.0 overlay (src/port/port_menu.cpp), gr2.ini
+(src/port/port_settings.c), window mode, VSync, frame limit, volume, reverb
+live; language with "Restart now" (RECOMP_LANGUAGE -> XC_LANGUAGE; checked:
+Spanish loads fv_spanish.xwb + intro_s.xmv, French fv_french.xwb).
+gr2.ini only exists once the menu has saved; then it wins over the
+launcher's variables. Test scripts set RECOMP_NO_INI=1.
+RECOMP_MENU_OPEN=1 starts with the menu open (screenshots / tests).
+
+Next: internal resolution (renderer work: scale render targets, viewports,
+surface copies), gamepad navigation of the menu (SDL game controller
+subsystem), then FSR / SMAA (step 3).

@@ -161,6 +161,16 @@ FetchContent_GetProperties(volk)
 if(NOT volk_POPULATED)
     FetchContent_Populate(volk)
 endif()
+# Dear ImGui (MIT): the port options overlay (docs/PORT_MENU_PLAN.md).
+# Sources only, compiled into the game below.
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.93.0
+    GIT_SHALLOW    TRUE)
+FetchContent_GetProperties(imgui)
+if(NOT imgui_POPULATED)
+    FetchContent_Populate(imgui)
+endif()
 
 target_sources(${PROJECT_NAME} PRIVATE
     src/port/vk_window.c
@@ -185,6 +195,21 @@ if(MSVC)
     set_source_files_properties(src/port/vk_window.c src/port/vk_backend.c src/port/vk_glsl.c
         PROPERTIES COMPILE_OPTIONS "/Zi")
 endif()
+# The port options menu (Dear ImGui) and its settings file. ImGui's include
+# path and defines go on these files only: target-wide they would rebuild
+# every generated chunk.
+set(PORT_MENU_SOURCES
+    src/port/port_menu.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+target_sources(${PROJECT_NAME} PRIVATE ${PORT_MENU_SOURCES} src/port/port_settings.c)
+set_source_files_properties(${PORT_MENU_SOURCES} PROPERTIES
+    INCLUDE_DIRECTORIES "${imgui_SOURCE_DIR};${imgui_SOURCE_DIR}/backends"
+    COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK)
 # nv2a_backend.h for the renderer only: a target-wide include would rebuild
 # every generated chunk.
 set_source_files_properties(src/port/vk_backend.c PROPERTIES

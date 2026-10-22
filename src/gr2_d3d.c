@@ -39,6 +39,27 @@ static int gr2_fence_passed(uint32_t dev, uint32_t fence)
     return (uint32_t)(write - fence) >= (uint32_t)(write - read);
 }
 
+/* The frame-time target: -2 = not read yet, -1 = the title's own, 0 = no
+ * limit, else milliseconds. s_title_frame_ms is the title's value, kept the
+ * first time it is overridden so "original" can put it back. */
+static volatile float s_frame_ms = -2.0f;
+static float s_title_frame_ms;
+
+void gr2_set_frame_ms(float ms)
+{
+    s_frame_ms = ms;
+}
+
+float gr2_get_frame_ms(void)
+{
+    float v = s_frame_ms;
+    if (v == -2.0f) {
+        const char *e = getenv("RECOMP_GR2_FRAME_MS");
+        v = e ? (float)atof(e) : -1.0f;
+    }
+    return v;
+}
+
 /* D3D_BlockOnTime(DWORD fence, DWORD flags) -- ret 8 */
 void sub_0042F970(void)
 {
@@ -52,19 +73,24 @@ void sub_0042F970(void)
 
     {
         /* The title's frame limiter (0x0007E19D): when the frame took less
-         * than *(float *)0x57BF1C ms it sleeps the rest. RECOMP_GR2_FRAME_MS
-         * overrides that target (0 = no limit); logged when it changes. */
+         * than *(float *)0x57BF1C ms it sleeps the rest. RECOMP_GR2_FRAME_MS,
+         * or the options menu (gr2_set_frame_ms), overrides that target
+         * (0 = no limit); logged when it changes. */
         static float last = -1.0f;
-        static int ovr = -2;
-        static float want;
         float cur = MEMF(0x57BF1C);
-        if (ovr == -2) {
+        float want = s_frame_ms;
+        if (want == -2.0f) {
             const char *e = getenv("RECOMP_GR2_FRAME_MS");
-            ovr = e != NULL;
-            want = e ? (float)atof(e) : 0.0f;
+            s_frame_ms = want = e ? (float)atof(e) : -1.0f;
         }
-        if (ovr && cur != want && cur > 0.0f)
+        if (want < 0.0f && s_title_frame_ms > 0.0f && cur != s_title_frame_ms)
+            MEMF(0x57BF1C) = s_title_frame_ms;         /* back to the title's own */
+        else if (want >= 0.0f && cur != want && cur > 0.0f) {
+            if (s_title_frame_ms <= 0.0f)
+                s_title_frame_ms = cur;                 /* remember the original */
             MEMF(0x57BF1C) = want;
+        }
+        int ovr = want >= 0.0f;
         if (cur != last) {
             fprintf(stderr, "  [GR2] frame limiter target %.3f ms%s\n", cur,
                     ovr ? " (overridden)" : "");
