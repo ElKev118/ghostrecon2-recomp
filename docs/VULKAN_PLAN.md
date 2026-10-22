@@ -257,3 +257,24 @@ dispatch 11 %, raw batch build 6.5 %, walk 6-10 %, texture lookup 4.6 %,
 index conversion 4.5 %, driver calls ~6 %). Next candidates: x87 stack and
 MMX as locals (game thread), passing 16-bit triangle-list indices straight
 to Vulkan, a second executor stage (decode vs. command recording).
+
+## 2026-10-22: two-stage executor, clocks, audio mixdown
+
+- Two-stage execution (RECOMP_PB_THREADS=2, on in run_gr2_sinlimite.bat):
+  walk 5.9 ms + back end 4.9 ms a frame in parallel; forest view ~114 FPS
+  on the 5700G (was ~80-90). Fence releases are queued behind the draws.
+- Character flicker above ~64 FPS (body between two poses, left hand off
+  the rifle): KeTickCount / interrupt time had GetTickCount's 15.6 ms
+  steps; now from the performance counter, KeTickCount advanced every ms
+  by a thread of its own. Fixed (user-verified).
+- Audio: the GP stand-in summed all 32 mixbins (centre left-only, I3DL2
+  reverb send dry on the left, effects burying voices, clipping). Now a
+  DSMIXBIN stereo downmix + soft reverb on the send (gain 0.08, user's
+  choice) + soft limiter. Gains: RECOMP_APU_GAIN_*.
+- Recompiler: x87 stack and MMX as locals; the 40 DirectSound functions
+  that reach the APU (mmio_functions.json, from RECOMP_MMIO_SITES) access
+  it directly, no trap (246 trapping sites -> 5).
+- Now the game thread is the limit, its cost spread over the title's own
+  functions (top ones 3-4 % each). Further gains need deeper code-quality
+  work in the recompiler (TLS frame-pointer publishes before every call,
+  volatile guest memory accesses).
