@@ -278,3 +278,5 @@ to Vulkan, a second executor stage (decode vs. command recording).
   functions (top ones 3-4 % each). Further gains need deeper code-quality
   work in the recompiler (TLS frame-pointer publishes before every call,
   volatile guest memory accesses).
+  OPTIONAL, for the end: only if raising the resolution costs notable FPS
+  (user, 2026-10-22).
