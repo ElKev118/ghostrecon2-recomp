@@ -1404,6 +1404,8 @@ static VkFormat raw_format(uint32_t type, uint32_t size)
     }
     if (f == VK_FORMAT_UNDEFINED)
         return f;
+    if (!ok[type][size] && !B.c)
+        return f;            /* asked before the device is up (vkb_vsh_accepts) */
     if (!ok[type][size]) {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(B.c->phys, f, &fp);
@@ -3103,6 +3105,21 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         busy0 ? (double)(busy - busy0) * 1000.0 / fq.QuadPart / frames : 0.0);
                 cpu0 = cpu;
                 busy0 = busy;
+                {
+                    /* Two-stage execution: the back end's own thread (this
+                     * one, then), and the walk's waits for queue space. */
+                    extern long long nv2a_pb_worker_ticks(void);
+                    extern long long nv2a_pb_queue_wait_ticks(void);
+                    static long long w0 = -1, q0;
+                    long long w = nv2a_pb_worker_ticks(), q = nv2a_pb_queue_wait_ticks();
+                    if (w0 >= 0 && w > w0)
+                        fprintf(stderr, "[VKB] back-end stage %.2f ms a frame, walk waited"
+                                " %.2f ms a frame for queue space\n",
+                                (double)(w - w0) * 1000.0 / fq.QuadPart / frames,
+                                (double)(q - q0) * 1000.0 / fq.QuadPart / frames);
+                    w0 = w;
+                    q0 = q;
+                }
                 fprintf(stderr, "[VKB] %.1f fps (%u pipelines, %d textures) | per frame: "
                         "%.1f submits, %.1f uploads, %.2f ms waiting for the GPU, GPU busy %.2f ms, "
                         "%.0f draws, %.0f passes, %.0f barriers, %.1f copies, %.0f KB hashed, %.0f KB vertices copied\n",
@@ -3302,8 +3319,23 @@ static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
     return 1;
 }
 
+/* What vkb_draw_vsh checks before it touches anything: the same answer,
+ * from any thread (two-stage execution asks from the pushbuffer walk). */
+static int vkb_vsh_accepts(const Nv2aBatchVsh *b)
+{
+    uint32_t k;
+    if (B.failed || b->ninputs > 16 || !b->nindices)
+        return 0;
+    if (b->raw)
+        for (k = 0; k < b->nattrs; k++)
+            if (raw_format(b->attr[k].type, b->attr[k].size) == VK_FORMAT_UNDEFINED)
+                return 0;
+    return 1;
+}
+
 static const Nv2aBackend s_vk_backend = {
-    vkb_clear, vkb_draw, vkb_flip, vkb_draw_xf, vkb_blit, vkb_present, vkb_draw_vsh
+    vkb_clear, vkb_draw, vkb_flip, vkb_draw_xf, vkb_blit, vkb_present, vkb_draw_vsh,
+    vkb_vsh_accepts
 };
 
 /* Called from main() after the window has been started. */
