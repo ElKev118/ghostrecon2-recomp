@@ -15,7 +15,8 @@ fi
 echo "[4/4] recomp (~4 min)"
 python -m tools.recomp $G/default.xbe --all --split 250 --gen-dir ../ghostrecon2/src/recomp/gen \
     --manual-functions ../ghostrecon2/manual_functions.json \
-    --trace-functions ../ghostrecon2/trace_functions.json > $G/regen_recomp.log 2>&1 || exit 1
+    --trace-functions ../ghostrecon2/trace_functions.json \
+    --mmio-functions ../ghostrecon2/mmio_functions.json > $G/regen_recomp.log 2>&1 || exit 1
 tail -2 $G/regen_recomp.log
 echo "build (~15 min, all generated chunks)"
 cmake --build ../ghostrecon2/build --config Release -- -m:8 -v:m > $G/regen_build.log 2>&1
