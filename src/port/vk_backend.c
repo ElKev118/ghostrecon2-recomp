@@ -1301,6 +1301,83 @@ static const char *FS_SRC =
     "#endif\n"
     "}\n";
 
+/* ---- pipeline cache ----------------------------------------------------
+ *
+ * The driver's half of a new pipeline (SPIR-V to GPU code) costs as much as
+ * glslang's, and it too was paid again every session. A VkPipelineCache,
+ * kept in the shader cache directory, hands the driver what it built last
+ * time; the driver itself rejects a file from another GPU or driver version
+ * (the header carries both), and then it simply starts empty. Saved a few
+ * seconds after new pipelines appear -- the process ends with _exit, so
+ * there is no "at exit". */
+static VkPipelineCache s_pcache;
+static volatile LONG s_pcache_new;
+static DWORD s_pcache_saved_at;
+static volatile LONG s_pipe_creates;
+static volatile LONG64 s_pipe_us;
+
+static void pcache_path(char *out, size_t n)
+{
+    snprintf(out, n, "%s\pipelines.bin", vkg_cache_dir());
+}
+
+static void pcache_init(void)
+{
+    VkPipelineCacheCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    void *data = NULL;
+    char path[MAX_PATH];
+
+    if (vkg_cache_dir()[0]) {
+        FILE *f;
+        pcache_path(path, sizeof path);
+        if ((f = fopen(path, "rb"))) {
+            long n;
+            fseek(f, 0, SEEK_END);
+            n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0 && (data = malloc((size_t)n))
+                && fread(data, 1, (size_t)n, f) == (size_t)n) {
+                ci.initialDataSize = (size_t)n;
+                ci.pInitialData = data;
+            }
+            fclose(f);
+        }
+    }
+    if (vkCreatePipelineCache(B.dev, &ci, NULL, &s_pcache) != VK_SUCCESS) {
+        ci.initialDataSize = 0;            /* a file the driver will not take */
+        ci.pInitialData = NULL;
+        if (vkCreatePipelineCache(B.dev, &ci, NULL, &s_pcache) != VK_SUCCESS)
+            s_pcache = VK_NULL_HANDLE;
+    }
+    fprintf(stderr, "[VKB] pipeline cache: %zu KB from disk\n", ci.initialDataSize / 1024);
+    free(data);
+}
+
+static void pcache_save(void)
+{
+    size_t n = 0;
+    void *data;
+    char path[MAX_PATH], tmp[MAX_PATH + 8];
+    FILE *f;
+
+    if (!s_pcache || !vkg_cache_dir()[0]
+        || vkGetPipelineCacheData(B.dev, s_pcache, &n, NULL) != VK_SUCCESS || !n)
+        return;
+    if (!(data = malloc(n)))
+        return;
+    if (vkGetPipelineCacheData(B.dev, s_pcache, &n, data) == VK_SUCCESS) {
+        pcache_path(path, sizeof path);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        if ((f = fopen(tmp, "wb"))) {
+            int ok = fwrite(data, 1, n, f) == n;
+            fclose(f);
+            if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                DeleteFileA(tmp);
+        }
+    }
+    free(data);
+}
+
 static VkShaderModule make_module(const char *src, int frag)
 {
     size_t bytes = 0;
@@ -1648,7 +1725,17 @@ cull_done:
     gp.pColorBlendState = &cb;
     gp.pDynamicState = &dy;
     gp.layout = B.layout;
-    if ((r = vkCreateGraphicsPipelines(B.dev, VK_NULL_HANDLE, 1, &gp, NULL, &p)) != VK_SUCCESS) {
+    {
+        LARGE_INTEGER a, b, fq;
+        QueryPerformanceCounter(&a);
+        r = vkCreateGraphicsPipelines(B.dev, s_pcache, 1, &gp, NULL, &p);
+        QueryPerformanceCounter(&b);
+        QueryPerformanceFrequency(&fq);
+        InterlockedIncrement(&s_pipe_creates);
+        InterlockedAdd64(&s_pipe_us, (b.QuadPart - a.QuadPart) * 1000000 / fq.QuadPart);
+        InterlockedIncrement(&s_pcache_new);
+    }
+    if (r != VK_SUCCESS) {
         fail("vkCreateGraphicsPipelines", r);
         return VK_NULL_HANDLE;
     }
@@ -1693,6 +1780,7 @@ static int init(void)
         return 0;
     }
     B.dev = B.c->dev;
+    pcache_init();
     pfnPushDescriptor = (PFN_vkCmdPushDescriptorSetKHR)
         vkGetDeviceProcAddr(B.dev, "vkCmdPushDescriptorSetKHR");
     {
@@ -3131,6 +3219,24 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         (double)s_stat_copies / frames,
                         (double)s_stat_hash_bytes / 1024.0 / frames,
                         (double)s_stat_vtx_bytes / 1024.0 / frames);
+                {
+                    /* New shaders and pipelines this second: each one is a
+                     * stall on the frame that needed it. */
+                    unsigned hits, compiles;
+                    double cms;
+                    LONG pc = InterlockedExchange(&s_pipe_creates, 0);
+                    LONG64 pus = InterlockedExchange64(&s_pipe_us, 0);
+                    vkg_stats(&hits, &compiles, &cms);
+                    if (pc || hits || compiles)
+                        fprintf(stderr, "[VKB] new: %ld pipelines (%.1f ms in the driver),"
+                                " shaders %u compiled (%.1f ms) + %u from the disk cache\n",
+                                (long)pc, (double)pus / 1000.0, compiles, cms, hits);
+                    if (s_pcache_new && GetTickCount() - s_pcache_saved_at > 3000) {
+                        InterlockedExchange(&s_pcache_new, 0);
+                        s_pcache_saved_at = GetTickCount();
+                        pcache_save();
+                    }
+                }
                 s_stat_wait = 0; s_stat_begins = 0; s_stat_uploads = 0;
                 s_stat_gpu_ms = 0; s_stat_draws = 0; s_stat_passes = 0;
                 s_stat_barriers = 0; s_stat_copies = 0; s_stat_hash_bytes = 0;
