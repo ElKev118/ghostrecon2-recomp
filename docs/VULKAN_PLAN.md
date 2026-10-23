@@ -317,3 +317,34 @@ RECOMP_TRACE_TIMES=4C039E,4C31BD (timed calls, APU clock).
   Video ran at half speed against the audio, hence the doubling. The tick now
   holds those bits until the DPC has run: 60 counts/s, the logo plays 10 s
   with no dry-out. Check with RECOMP_VBLANK_PROBE=0x43A1B8 (raised vs dev).
+
+## Mission 2 (s02 pagoda) metallic sound -- OPTIONAL, tolerable (2026-10-22)
+
+User report: in mission 2 (rain) there is, besides the rain and the voices
+(both fine), a strange metallic sound, "like iron rods knocking". Not in
+xemu. The user rates it tolerable: revisit at the end, optional.
+
+Ruled out / fixed on the way (toolkit 39949b7): NtSetTimerEx was a stub, so
+the sound engine's 50 ms stream-service timer never fired (no menu music,
+starved ambient streams). That is fixed and the music plays, but the
+metallic sound is still there -- so it is not stream starvation.
+
+Leads, from RECOMP_APU_TRACE (per-voice [APU-VSTAT] once a second) during
+the mission 2 load/play:
+- v75 / v78 / v81: fmt A200E0E6 (ADPCM mono, not a stream), rate=24.000,
+  frames=2001/s, vol 6CE/FFF, bin 3/0, same address 00A17AF0 and same rms
+  for all three. A pitch ratio of 24 is far outside anything else in the
+  mix: a short sample looped at a huge pitch (or a pitch register misread)
+  would sound exactly like a metallic buzz/knock. First thing to check:
+  the voice's TAR_PITCH as written by the title vs how voice_process
+  converts it (xemu: pitch is a signed 4.12 octave offset).
+- v77 / v80 / v83: fmt AA01E020 = MULTIPASS (bit 21) stereo, spb field used
+  as the multipass bin (1), bins 6/7. Multipass voices read another voice's
+  output from a bin; if that path is approximate it can ring metallically.
+- v76 / v79 / v82 / v173: fmt A200E0C5, bin 31 -- the reverb/submix send.
+- The groups of three identical voices suggest one emitter played three
+  times (or one per listener channel); compare with xemu's voice list.
+
+How to look: RECOMP_APU_TRACE=1 RECOMP_APU_VOICE_DUMP=<v> (raw s16 of one
+voice, RECOMP_APU_VOICE_DUMP_FILE) in mission 2, listen to each candidate
+voice alone; mute candidates one at a time to find which one is the sound.
