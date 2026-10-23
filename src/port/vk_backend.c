@@ -742,6 +742,8 @@ static uint32_t s_view_w, s_view_h;
 /* RECOMP_VK_PROBE: 1 = flag file seen, 2 = a present happened since,
  * 3 = probing, 4 = the probed frame was presented. */
 static int s_probe_armed;
+static unsigned s_presents;           /* frames presented, for once-a-frame checks */
+static int s_probe_from_env;          /* RECOMP_VK_PROBE points (else an F7 capture) */
 #define PROBE_MAX 3000
 #define PROBE_R   32
 #define PROBE_PTS 6
@@ -753,8 +755,8 @@ typedef struct {
 } ProbeRec;
 static ProbeRec s_probe_rec[PROBE_MAX];
 /* The points probed: from RECOMP_VK_PROBE, or found by the F7 cyan capture. */
-static int px = -2, py, npts;
-static int ptx[PROBE_PTS], pty[PROBE_PTS];
+static int s_probe_x = -2, s_probe_y, s_probe_n;
+static int s_probe_px[PROBE_PTS], s_probe_py[PROBE_PTS];
 static VkBuffer s_probe_buf;
 static VkDeviceMemory s_probe_mem;
 static uint8_t *s_probe_map;
@@ -2481,22 +2483,28 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
          * the draw's state -- which draw turns a pixel wrong. */
         /* RECOMP_VK_PROBE=x,y[;x,y...]: up to PROBE_PTS points at once. */
         static int active, done, idx;
-        if (px == -2) {
+        if (s_probe_x == -2) {
             const char *e = getenv("RECOMP_VK_PROBE");
-            px = -1;
-            while (e && npts < PROBE_PTS && sscanf(e, "%d,%d", &ptx[npts], &pty[npts]) == 2) {
-                npts++;
+            s_probe_x = -1;
+            while (e && s_probe_n < PROBE_PTS && sscanf(e, "%d,%d", &s_probe_px[s_probe_n], &s_probe_py[s_probe_n]) == 2) {
+                s_probe_n++;
                 e = strchr(e, ';');
                 if (e) e++;
             }
-            if (npts) { px = ptx[0]; py = pty[0]; }
+            if (s_probe_n) { s_probe_x = s_probe_px[0]; s_probe_y = s_probe_py[0]; }
+            s_probe_from_env = s_probe_n > 0;
         }
-        if (px >= 0 && !done) {
+        if (s_probe_x >= 0 && !done) {
             /* Start at a frame boundary (the next present), so the log
              * covers one whole frame from its first draw. */
-            if (!active && !s_probe_armed
-                && GetFileAttributesA("probe.flag") != INVALID_FILE_ATTRIBUTES)
-                s_probe_armed = 1;
+            /* The flag file once a frame, not once a draw: a file-system
+             * call per draw cost ~35 ms a frame in the forest. */
+            static unsigned flag_checked_at = ~0u;
+            if (!active && !s_probe_armed && flag_checked_at != s_presents) {
+                flag_checked_at = s_presents;
+                if (GetFileAttributesA("probe.flag") != INVALID_FILE_ATTRIBUTES)
+                    s_probe_armed = 1;
+            }
             if (!active && s_probe_armed == 2) {
                 active = 1;
                 s_probe_armed = 3;
@@ -2534,8 +2542,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     r->t3 = stages ? stages[3].t.offset : 0; r->t3f = stages ? stages[3].t.color : 0;
                     if (r->ok) {
                         to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                        for (p = 0; p < npts; p++) {
-                            int x0 = ptx[p] - PROBE_R / 2, y0 = pty[p] - PROBE_R / 2;
+                        for (p = 0; p < s_probe_n; p++) {
+                            int x0 = s_probe_px[p] - PROBE_R / 2, y0 = s_probe_py[p] - PROBE_R / 2;
                             if (x0 < 0) x0 = 0;
                             if (y0 < 0) y0 = 0;
                             if (x0 + PROBE_R > (int)t->w) x0 = (int)t->w - PROBE_R;
@@ -2567,9 +2575,9 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             begin_frame();
             B.rt_color = NULL;
             fprintf(stderr, "[PROBE] done after %d draws\n", idx);
-            for (i = 0; i < idx * npts; i++) {
-                const ProbeRec *r = &s_probe_rec[i / npts];
-                const uint8_t *m = s_probe_map + ((size_t)(i / npts) * PROBE_PTS + i % npts) * PROBE_R * PROBE_R * 4;
+            for (i = 0; i < idx * s_probe_n; i++) {
+                const ProbeRec *r = &s_probe_rec[i / s_probe_n];
+                const uint8_t *m = s_probe_map + ((size_t)(i / s_probe_n) * PROBE_PTS + i % s_probe_n) * PROBE_R * PROBE_R * 4;
                 const uint8_t *ce = m + ((PROBE_R / 2) * PROBE_R + PROBE_R / 2) * 4;
                 unsigned cyan = 0, dark = 0, k, sum = 0;
                 if (!r->ok) continue;
@@ -2582,7 +2590,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 fprintf(stderr, "[PROBE] #%d p%d (%d,%d) surf %08X n %u | RGBA %3u %3u %3u %3u | sq dark %u cyan %u avg %u"
                         " | blend %u %X/%X cmask %08X | prog %05X ctl %08X fin %08X %08X | t0 %08X fmt %02X t1 %08X fmt %02X"
                         " t2 %08X fmt %02X t3 %08X fmt %02X\n",
-                        i / npts, i % npts, ptx[i % npts], pty[i % npts], r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
+                        i / s_probe_n, i % s_probe_n, s_probe_px[i % s_probe_n], s_probe_py[i % s_probe_n], r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
                         sum / (PROBE_R * PROBE_R * 3), r->blend, r->bsrc, r->bdst, r->cmask,
                         r->sp, r->ctl, r->f0, r->f1, r->t0, r->t0f, r->t1, r->t1f,
                         r->t2, r->t2f, r->t3, r->t3f);
@@ -2612,6 +2620,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                 shot++;
                 DeleteFileA("probe.flag");
                 active = 0; done = 0; idx = 0; s_probe_armed = 0;
+                if (!s_probe_from_env)
+                    s_probe_x = -1;       /* an F7 capture: one frame, then off */
             }
             begin_frame();
             B.rt_color = NULL;
@@ -3218,7 +3228,7 @@ static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
               + abs((int)y - (int)((2 * cy + 1) * h / (2 * GY)));
             if (d < bd[cy][cx]) { bd[cy][cx] = d; bx[cy][cx] = (int)x; by[cy][cx] = (int)y; }
         }
-    npts = 0;
+    s_probe_n = 0;
     for (i = 0; i < PROBE_PTS; i++) {
         int best = -1, bxx = 0, byy = 0;
         unsigned bc = 0;
@@ -3227,21 +3237,21 @@ static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
                 if (cnt[y][x] > bc && cnt[y][x] >= 16) { bc = cnt[y][x]; best = 1; bxx = (int)x; byy = (int)y; }
         if (best < 0)
             break;
-        ptx[npts] = bx[byy][bxx];
-        pty[npts] = by[byy][bxx];
+        s_probe_px[s_probe_n] = bx[byy][bxx];
+        s_probe_py[s_probe_n] = by[byy][bxx];
         found += (int)bc;
-        npts++;
+        s_probe_n++;
         cnt[byy][bxx] = 0;
     }
     fprintf(stderr, "[CYAN] capture %u: frame %ux%u written to %s; %d cyan pixels in the"
-            " probed cells, %d points:", shot, w, h, path, found, npts);
-    for (i = 0; i < npts; i++)
-        fprintf(stderr, " (%d,%d)", ptx[i], pty[i]);
-    fprintf(stderr, "%s\n", npts ? " -- probing the next frame" : " -- nothing cyan on screen");
+            " probed cells, %d points:", shot, w, h, path, found, s_probe_n);
+    for (i = 0; i < s_probe_n; i++)
+        fprintf(stderr, " (%d,%d)", s_probe_px[i], s_probe_py[i]);
+    fprintf(stderr, "%s\n", s_probe_n ? " -- probing the next frame" : " -- nothing cyan on screen");
     fflush(stderr);
-    if (npts) {
-        px = ptx[0];
-        py = pty[0];
+    if (s_probe_n) {
+        s_probe_x = s_probe_px[0];
+        s_probe_y = s_probe_py[0];
         s_probe_armed = 1;        /* the next present starts the probed frame */
     }
     shot++;
@@ -3254,6 +3264,7 @@ static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
 static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         uint32_t aa_sx, uint32_t aa_sy)
 {
+    s_presents++;
     if (s_probe_armed == 1 || s_probe_armed == 3)
         s_probe_armed++;                       /* 3 -> 4: the frame is done */
     Surface *s;
