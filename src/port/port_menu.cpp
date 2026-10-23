@@ -244,6 +244,21 @@ static void panel(void)
                                   "resolution. Light; most useful at native or x1.5-x2.");
         }
         {
+            static const char *ups[] = { "Bilinear", "FSR 1" };
+            if (ImGui::Combo("Upscaling", &s->upscaler, ups, IM_ARRAYSIZE(ups)))
+                changed = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("When the window is bigger than the internal resolution:\n"
+                                  "FSR 1 enlarges with sharp edges; Bilinear is softer.");
+            if (s->upscaler == 1) {
+                float sh = s->sharpness * 100.0f;
+                if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 100.0f, "%.0f%%")) {
+                    s->sharpness = sh / 100.0f;
+                    changed = true;
+                }
+            }
+        }
+        {
             static const char *filters[] = { "Bilinear", "Area (supersampling)" };
             if (ImGui::Combo("Downscale filter", &s->scale_filter, filters, IM_ARRAYSIZE(filters)))
                 changed = true;

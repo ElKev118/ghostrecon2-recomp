@@ -617,9 +617,16 @@ static int present(int upload)
             VkImageView shown = gpu_view;
             if (port_settings()->aa == PS_AA_SMAA)
                 shown = vkp_smaa(V.cmd, gpu_view, sw, sh);
-            vkp_draw(V.cmd, shown, sw, sh, V.swap_view[idx], V.swap_fmt,
-                     V.swap_ext.width, V.swap_ext.height, rect,
-                     port_settings()->scale_filter);
+            /* Enlarged (the window is bigger than the internal
+             * resolution): FSR 1 if chosen; else the scaling pass. */
+            if (!(port_settings()->upscaler == PS_UPSCALE_FSR1
+                  && (dw > sw || dh > sh)
+                  && vkp_fsr(V.cmd, shown, sw, sh, V.swap_view[idx], V.swap_fmt,
+                             V.swap_ext.width, V.swap_ext.height, rect,
+                             2.0f * (1.0f - port_settings()->sharpness))))
+                vkp_draw(V.cmd, shown, sw, sh, V.swap_view[idx], V.swap_fmt,
+                         V.swap_ext.width, V.swap_ext.height, rect,
+                         port_settings()->scale_filter);
             barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,

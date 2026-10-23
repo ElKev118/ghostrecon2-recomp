@@ -7,7 +7,8 @@
  * which a single bilinear blit cannot do -- it reads 2x2 texels however
  * much is being shrunk, so at 4x on a 1080p screen most of the detail was
  * skipped and edges shimmered. SMAA runs here too, on the frame at the
- * internal resolution before it is scaled; FSR comes next.
+ * internal resolution before it is scaled, and FSR 1 when the frame is
+ * enlarged.
  */
 #ifndef GR2_VK_POST_H
 #define GR2_VK_POST_H
@@ -25,6 +26,13 @@ int vkp_init(VkDevice dev, VkFormat target_format);
 /* SMAA 1x on src (w x h, SHADER_READ_ONLY_OPTIMAL): returns a view of the
  * result in the same layout, or src itself if SMAA is unavailable. */
 VkImageView vkp_smaa(VkCommandBuffer cmd, VkImageView src, uint32_t w, uint32_t h);
+
+/* FSR 1 in place of vkp_draw when the frame is enlarged (rect larger than
+ * src_w x src_h): EASU then RCAS, sharpness in stops (0 = sharpest, 2 =
+ * soft). Same layouts as vkp_draw. Returns 0 if unavailable. */
+int vkp_fsr(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h,
+            VkImageView dst, VkFormat dst_format, uint32_t dst_w, uint32_t dst_h,
+            VkRect2D rect, float sharpness);
 
 /* Record the pass into cmd. src is in SHADER_READ_ONLY_OPTIMAL, dst (a view
  * of the swapchain image) in COLOR_ATTACHMENT_OPTIMAL; the frame lands in

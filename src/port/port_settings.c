@@ -78,6 +78,8 @@ void port_settings_startup(void)
     s_cur.aspect = env_int("RECOMP_ASPECT", PS_ASPECT_4_3);
     s_cur.scale_filter = env_int("RECOMP_SCALE_FILTER", 1);
     s_cur.aa = env_int("RECOMP_AA", PS_AA_OFF);
+    s_cur.upscaler = env_int("RECOMP_UPSCALER", PS_UPSCALE_FSR1);
+    s_cur.sharpness = 0.9f;                        /* AMD's default: 0.2 stops */
 
     if (use_ini) {
         char buf[16];
@@ -94,6 +96,8 @@ void port_settings_startup(void)
         s_cur.aspect = ini_int("Display", "Aspect", s_cur.aspect);
         s_cur.scale_filter = ini_int("Display", "ScaleFilter", s_cur.scale_filter);
         s_cur.aa = ini_int("Display", "AntiAliasing", s_cur.aa);
+        s_cur.upscaler = ini_int("Display", "Upscaler", s_cur.upscaler);
+        s_cur.sharpness = ini_float("Display", "Sharpness", s_cur.sharpness);
         _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
 
         /* Read once by the window and the kernel at their own start. */
@@ -144,6 +148,8 @@ int port_settings_save(void)
     snprintf(b, sizeof b, "%d", s_cur.aspect);      ok &= put("Display", "Aspect", b);
     snprintf(b, sizeof b, "%d", s_cur.scale_filter); ok &= put("Display", "ScaleFilter", b);
     snprintf(b, sizeof b, "%d", s_cur.aa);          ok &= put("Display", "AntiAliasing", b);
+    snprintf(b, sizeof b, "%d", s_cur.upscaler);    ok &= put("Display", "Upscaler", b);
+    snprintf(b, sizeof b, "%.2f", s_cur.sharpness); ok &= put("Display", "Sharpness", b);
     snprintf(b, sizeof b, "%d", s_cur.volume);      ok &= put("Audio", "Volume", b);
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);
     snprintf(b, sizeof b, "%.3f", s_cur.ambience);  ok &= put("Audio", "Ambience", b);
