@@ -344,6 +344,8 @@ static DWORD WINAPI sampler_thread(LPVOID arg)
 
     if (!out)
         return 0;
+    if (getenv("RECOMP_SAMPLE_START"))     /* ms: skip the boot and menus */
+        Sleep((DWORD)atoi(getenv("RECOMP_SAMPLE_START")));
     for (;;) {
         CONTEXT ctx;
         STACKFRAME64 sf;
@@ -436,12 +438,15 @@ static DWORD WINAPI sampler_thread(LPVOID arg)
 /* RECOMP_SAMPLE_THREAD=pb samples the pushbuffer executor instead of the
  * guest's main thread: its handle appears once it has walked a pushbuffer. */
 extern void *g_pb_exec_thread;
+extern void *g_pb_worker_thread;    /* =pbw: the back-end stage (PB_THREADS=2) */
+static int s_sample_worker;
 
 static DWORD WINAPI sampler_wait_pb(LPVOID arg)
 {
-    while (!g_pb_exec_thread)
+    void *volatile *h = s_sample_worker ? &g_pb_worker_thread : &g_pb_exec_thread;
+    while (!*h)
         Sleep(10);
-    s_sample_target = (HANDLE)g_pb_exec_thread;
+    s_sample_target = (HANDLE)*h;
     return sampler_thread(arg);
 }
 
@@ -453,10 +458,11 @@ static void sampler_start(void)
 
     if (!every)
         return;
-    if (which && !strcmp(which, "pb")) {
+    if (which && (!strcmp(which, "pb") || !strcmp(which, "pbw"))) {
+        s_sample_worker = !strcmp(which, "pbw");
         CreateThread(NULL, 0, sampler_wait_pb, (LPVOID)(uintptr_t)every, 0, NULL);
-        fprintf(stderr, "[SAMPLE] pushbuffer thread, every %lu ms\n",
-                (unsigned long)every);
+        fprintf(stderr, "[SAMPLE] pushbuffer %s thread, every %lu ms\n",
+                s_sample_worker ? "back-end" : "walk", (unsigned long)every);
         return;
     }
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
