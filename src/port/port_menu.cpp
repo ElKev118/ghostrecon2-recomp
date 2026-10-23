@@ -231,6 +231,11 @@ static void panel(void)
             s->reverb = rv / 100.0f;
             changed = true;
         }
+        float am = s->ambience * 100.0f;
+        if (ImGui::SliderFloat("Ambience (rain)", &am, 0.0f, 100.0f, "%.0f%%")) {
+            s->ambience = am / 100.0f;
+            changed = true;
+        }
     }
 
     if (ImGui::CollapsingHeader("Game", ImGuiTreeNodeFlags_DefaultOpen)) {

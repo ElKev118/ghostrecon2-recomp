@@ -22,6 +22,7 @@ typedef struct {
     float frame_ms;        /* -1 = the title's own (30 FPS), 0 = no limit */
     int   volume;          /* 0..100 */
     float reverb;          /* reverb send, 0..0.5 */
+    float ambience;        /* level of sounds many voices share (rain), 0..1 */
     int   language;        /* console code: 1 en, 3 de, 4 fr, 5 es, 6 it */
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
 } PortSettings;

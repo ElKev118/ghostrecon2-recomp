@@ -337,8 +337,24 @@ RECOMP_TRACE_TIMES=4C039E,4C31BD (timed calls, APU clock).
 
 ## Mission 2 (s02 pagoda) metallic sound -- OPTIONAL, tolerable (2026-10-22)
 
-LIKELY SOLVED 2026-10-23 (toolkit 001b61a, 7004463; awaiting the user's
-ear): the rate=24 voices are rumble recorded at 2 kHz, stretched 24x by
+SOLVED 2026-10-23 (toolkit bf09d8a, 14afac1 and the "Ambience" commit; the
+user: "ya suena mucho mejor"). The rain is ~60 voices playing ONE drop
+sample (same base address), each through multipass (bin 31) into a 3D
+voice, started on a 16 ms tick. Summed with nothing to tell them apart,
+the copies are a comb filter at 62.5 Hz harmonics: the metallic ring (a
+16 ms cepstral peak in the 3D bins; F6 per-group WAVs: only _3d rang).
+xemu runs the VP's HRTF on the 3D voices by default (config hrtf: true);
+we had it off. The HRIR breaks up the comb; the ITD alone does not. On all
+3D voices the HRIR also dulled and quietened speech and shots, so the
+default (RECOMP_APU_HRTF=dense) runs it only on 3D voices whose sample 8+
+voices played in the last VP frame, delays each such voice slot by its own
+fixed 0-20 ms (scatters the 16 ms tick; RECOMP_APU_DENSE_DELAY=0 off) and
+scales them by the "Ambience" setting (gr2.ini [Audio] Ambience, menu
+slider, default 0.6; the rain sat loud over speech). RECOMP_APU_HRTF=0 / 1
+/ itd: off / all 3D voices / delay only. xemu's flat VP-monitor mixdown
+(RECOMP_APU_MIXDOWN=vp, a4c2750) did NOT help by ear.
+
+Earlier (001b61a, 7004463): the rate=24 voices are rumble recorded at 2 kHz, stretched 24x by
 the VP's linear interpolation, which leaves images every 2 kHz (an F6
 capture: a burst at 3996/5765 Hz). The LFE bin is now low-passed at 120 Hz
 before the stereo downmix, and every voice upsampled 1.5x or more is

@@ -14,6 +14,8 @@ extern void  xbox_AudioSetVolume(int pct);
 extern int   xbox_AudioGetVolume(void);
 extern void  xbox_AudioSetReverb(float gain);
 extern float xbox_AudioGetReverb(void);
+extern void  xbox_AudioSetAmbience(float gain);
+extern float xbox_AudioGetAmbience(void);
 extern void  gr2_set_frame_ms(float ms);
 extern float gr2_get_frame_ms(void);
 
@@ -66,6 +68,7 @@ void port_settings_startup(void)
     s_cur.frame_ms = gr2_get_frame_ms();
     s_cur.volume = xbox_AudioGetVolume();
     s_cur.reverb = xbox_AudioGetReverb();
+    s_cur.ambience = xbox_AudioGetAmbience();
     s_cur.language = env_int("RECOMP_LANGUAGE", 1);
     s_cur.shader_cache = !(getenv("RECOMP_SHADER_CACHE")
                            && getenv("RECOMP_SHADER_CACHE")[0] == '0');
@@ -78,6 +81,7 @@ void port_settings_startup(void)
         s_cur.frame_ms    = ini_float("Display", "FrameLimitMs", s_cur.frame_ms);
         s_cur.volume      = ini_int("Audio", "Volume", s_cur.volume);
         s_cur.reverb      = ini_float("Audio", "Reverb", s_cur.reverb);
+        s_cur.ambience    = ini_float("Audio", "Ambience", s_cur.ambience);
         s_cur.language    = ini_int("Game", "Language", s_cur.language);
         s_cur.shader_cache = ini_int("Display", "ShaderCache", s_cur.shader_cache);
         _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
@@ -106,6 +110,7 @@ void port_settings_apply_live(void)
 {
     xbox_AudioSetVolume(s_cur.volume);
     xbox_AudioSetReverb(s_cur.reverb);
+    xbox_AudioSetAmbience(s_cur.ambience);
     gr2_set_frame_ms(s_cur.frame_ms);
 }
 
@@ -125,6 +130,7 @@ int port_settings_save(void)
     snprintf(b, sizeof b, "%.3f", s_cur.frame_ms);  ok &= put("Display", "FrameLimitMs", b);
     snprintf(b, sizeof b, "%d", s_cur.volume);      ok &= put("Audio", "Volume", b);
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);
+    snprintf(b, sizeof b, "%.3f", s_cur.ambience);  ok &= put("Audio", "Ambience", b);
     snprintf(b, sizeof b, "%d", s_cur.language);    ok &= put("Game", "Language", b);
     fprintf(stderr, "[PORT] settings %s %s\n", ok ? "saved to" : "NOT saved to", s_path);
     return ok;
