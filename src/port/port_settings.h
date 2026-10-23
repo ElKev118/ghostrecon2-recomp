@@ -16,6 +16,7 @@ extern "C" {
 
 enum { PS_WINDOWED = 0, PS_BORDERLESS = 1, PS_FULLSCREEN = 2 };
 enum { PS_ASPECT_4_3 = 0, PS_ASPECT_16_9 = 1, PS_ASPECT_FILL = 2 };
+enum { PS_AA_OFF = 0, PS_AA_SMAA = 1 };
 
 typedef struct {
     int   window_mode;     /* PS_* */
@@ -28,6 +29,7 @@ typedef struct {
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
     float render_scale;    /* internal resolution, times 640x480 (1..5) */
     int   aspect;          /* PS_ASPECT_*: how the 4:3 frame fills the window */
+    int   aa;              /* PS_AA_*: anti-aliasing of the frame */
     int   scale_filter;    /* VKP_*: 1 area (shrinking averages each pixel), 0 bilinear */
 } PortSettings;
 

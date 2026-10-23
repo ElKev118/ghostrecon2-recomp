@@ -236,6 +236,14 @@ static void panel(void)
                                   "as xemu's widescreen view does.");
         }
         {
+            static const char *aas[] = { "Off", "SMAA" };
+            if (ImGui::Combo("Anti-aliasing", &s->aa, aas, IM_ARRAYSIZE(aas)))
+                changed = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("SMAA smooths jagged edges on the frame, at the internal\n"
+                                  "resolution. Light; most useful at native or x1.5-x2.");
+        }
+        {
             static const char *filters[] = { "Bilinear", "Area (supersampling)" };
             if (ImGui::Combo("Downscale filter", &s->scale_filter, filters, IM_ARRAYSIZE(filters)))
                 changed = true;

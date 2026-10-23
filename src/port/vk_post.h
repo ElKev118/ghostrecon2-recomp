@@ -6,7 +6,8 @@
  * above the window) is averaged over each screen pixel's whole footprint,
  * which a single bilinear blit cannot do -- it reads 2x2 texels however
  * much is being shrunk, so at 4x on a 1080p screen most of the detail was
- * skipped and edges shimmered. Later passes (SMAA, FSR) go here as well.
+ * skipped and edges shimmered. SMAA runs here too, on the frame at the
+ * internal resolution before it is scaled; FSR comes next.
  */
 #ifndef GR2_VK_POST_H
 #define GR2_VK_POST_H
@@ -20,6 +21,10 @@ enum { VKP_BILINEAR = 0, VKP_AREA = 1 };
 /* Once, after the device: 0 if the pass cannot be built (the caller keeps
  * blitting). */
 int vkp_init(VkDevice dev, VkFormat target_format);
+
+/* SMAA 1x on src (w x h, SHADER_READ_ONLY_OPTIMAL): returns a view of the
+ * result in the same layout, or src itself if SMAA is unavailable. */
+VkImageView vkp_smaa(VkCommandBuffer cmd, VkImageView src, uint32_t w, uint32_t h);
 
 /* Record the pass into cmd. src is in SHADER_READ_ONLY_OPTIMAL, dst (a view
  * of the swapchain image) in COLOR_ATTACHMENT_OPTIMAL; the frame lands in

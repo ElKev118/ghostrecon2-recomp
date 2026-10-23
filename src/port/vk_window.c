@@ -614,7 +614,10 @@ static int present(int upload)
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-            vkp_draw(V.cmd, gpu_view, sw, sh, V.swap_view[idx], V.swap_fmt,
+            VkImageView shown = gpu_view;
+            if (port_settings()->aa == PS_AA_SMAA)
+                shown = vkp_smaa(V.cmd, gpu_view, sw, sh);
+            vkp_draw(V.cmd, shown, sw, sh, V.swap_view[idx], V.swap_fmt,
                      V.swap_ext.width, V.swap_ext.height, rect,
                      port_settings()->scale_filter);
             barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
