@@ -226,6 +226,15 @@ static void panel(void)
                 ImGui::SetTooltip("The game's 3D drawn at this size, then fitted to the window.\n"
                                   "Pick the one nearest your screen's height.");
         }
+        {
+            static const char *aspects[] = { "4:3 (original)", "16:9 (stretched)",
+                                             "Fill window (stretched)" };
+            if (ImGui::Combo("Aspect ratio", &s->aspect, aspects, IM_ARRAYSIZE(aspects)))
+                changed = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The game draws 4:3; 16:9 stretches it sideways,\n"
+                                  "as xemu's widescreen view does.");
+        }
 
         bool sc = s->shader_cache != 0;
         if (ImGui::Checkbox("Shader cache", &sc)) {

@@ -570,9 +570,15 @@ static int present(int upload)
         uint32_t ww = V.swap_ext.width, wh = V.swap_ext.height;
         /* The display is 4:3 whatever the surface: an anti-aliased surface
          * is twice as wide (and maybe as tall) as what it shows. */
-        uint32_t dw = ww, dh = ww * 3 / 4;
-
-        if (dh > wh) { dh = wh; dw = wh * 4 / 3; }
+        /* The aspect setting: the title's 4:3, or stretched to 16:9 (as
+         * xemu shows it; GR2 has no widescreen mode of its own), or to the
+         * whole window. */
+        uint32_t ax = 4, ay = 3, dw, dh;
+        if (port_settings()->aspect == PS_ASPECT_16_9) { ax = 16; ay = 9; }
+        dw = ww;
+        dh = ww * ay / ax;
+        if (dh > wh) { dh = wh; dw = wh * ax / ay; }
+        if (port_settings()->aspect == PS_ASPECT_FILL) { dw = ww; dh = wh; }
         memset(&b, 0, sizeof(b));
         b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         b.srcSubresource.layerCount = 1;

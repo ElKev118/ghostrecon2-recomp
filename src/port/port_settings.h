@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 enum { PS_WINDOWED = 0, PS_BORDERLESS = 1, PS_FULLSCREEN = 2 };
+enum { PS_ASPECT_4_3 = 0, PS_ASPECT_16_9 = 1, PS_ASPECT_FILL = 2 };
 
 typedef struct {
     int   window_mode;     /* PS_* */
@@ -26,6 +27,7 @@ typedef struct {
     int   language;        /* console code: 1 en, 3 de, 4 fr, 5 es, 6 it */
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
     float render_scale;    /* internal resolution, times 640x480 (1..5) */
+    int   aspect;          /* PS_ASPECT_*: how the 4:3 frame fills the window */
 } PortSettings;
 
 /* Read gr2.ini (if any) and push what must be in place before the guest
