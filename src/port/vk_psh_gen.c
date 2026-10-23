@@ -211,7 +211,9 @@ size_t vk_psh_gen(const uint32_t *spec, int zofs, char *buf, size_t cap)
         }
         /* Registers. */
         put(&g, "  vec4 r0 = vec4(0.0), r1 = vec4(0.0), r2 = vec4(0.0);\n"
-                "  vec4 r3 = vec4(unpk(rc.misc.z).rgb, fog_factor(vFog.x));\n"
+                /* FOG_COLOR: red in bits 0-7, the reverse of unpk's
+                 * D3DCOLOR -- as rgb, far terrain went teal. */
+                "  vec4 r3 = vec4(unpk(rc.misc.z).bgr, fog_factor(vFog.x));\n"
                 "  vec4 r4 = vD0, r5 = vD1, r6 = vec4(0.0), r7 = vec4(0.0);\n"
                 "  vec4 r8 = t0, r9 = t1, r10 = t2, r11 = t3;\n"
                 "  vec4 r12 = vec4(0.0), r13 = vec4(0.0), r14 = vec4(0.0), r15 = vec4(0.0);\n");

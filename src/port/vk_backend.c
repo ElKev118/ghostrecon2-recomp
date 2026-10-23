@@ -746,7 +746,7 @@ static int s_probe_armed;
 #define PROBE_R   32
 #define PROBE_PTS 6
 typedef struct {
-    uint32_t ok, surf, count, blend, bsrc, bdst, cmask, sp, ctl, f0, f1, t0, t0f, t1, t1f;
+    uint32_t ok, surf, count, blend, bsrc, bdst, cmask, sp, ctl, f0, f1, t0, t0f, t1, t1f, t2, t2f, t3, t3f;
     /* Enough to evaluate the draw's combiners by hand. */
     uint32_t seen, cicw[8], aicw[8], cocw[8], aocw[8], k0[8], k1[8];
     float d0[4], tc0[4];
@@ -1236,7 +1236,10 @@ static const char *FS_SRC =
     "      } else t[st] = vec4(0.0);\n"
     "    }\n"
     "    for (int k = 0; k < 16; k++) R[k] = vec4(0.0);\n"
-    "    R[3] = vec4(unpk(rc.misc.z).rgb, fog_factor(vFog.x));\n"
+    /* FOG_COLOR has red in bits 0-7, the reverse of a D3DCOLOR (unpk): read
+     * as one, the yellow-grey fog of Ghost Recon 2's forest turned blue-grey
+     * and everything far enough to be fogged went teal. */
+    "    R[3] = vec4(unpk(rc.misc.z).bgr, fog_factor(vFog.x));\n"
     "    R[4] = vD0; R[5] = vD1;\n"
     "    R[8] = t[0]; R[9] = t[1]; R[10] = t[2]; R[11] = t[3];\n"
     "    if (pc.alpha.w == 20) { outColor = vec4(t[0].rgb, 1.0); return; }\n"
@@ -2527,6 +2530,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     memcpy(r->tc0, v[0].tex[0], sizeof r->tc0);
                     r->t0 = stages ? stages[0].t.offset : 0; r->t0f = stages ? stages[0].t.color : 0;
                     r->t1 = stages ? stages[1].t.offset : 0; r->t1f = stages ? stages[1].t.color : 0;
+                    r->t2 = stages ? stages[2].t.offset : 0; r->t2f = stages ? stages[2].t.color : 0;
+                    r->t3 = stages ? stages[3].t.offset : 0; r->t3f = stages ? stages[3].t.color : 0;
                     if (r->ok) {
                         to_layout(t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
                         for (p = 0; p < npts; p++) {
@@ -2575,10 +2580,12 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                     else if (gg + bb > 60 && 2 * rr < gg && 2 * rr < bb) cyan++;
                 }
                 fprintf(stderr, "[PROBE] #%d p%d (%d,%d) surf %08X n %u | RGBA %3u %3u %3u %3u | sq dark %u cyan %u avg %u"
-                        " | blend %u %X/%X cmask %08X | prog %05X ctl %08X fin %08X %08X | t0 %08X fmt %02X t1 %08X fmt %02X\n",
+                        " | blend %u %X/%X cmask %08X | prog %05X ctl %08X fin %08X %08X | t0 %08X fmt %02X t1 %08X fmt %02X"
+                        " t2 %08X fmt %02X t3 %08X fmt %02X\n",
                         i / npts, i % npts, ptx[i % npts], pty[i % npts], r->surf, r->count, ce[2], ce[1], ce[0], ce[3], dark, cyan,
                         sum / (PROBE_R * PROBE_R * 3), r->blend, r->bsrc, r->bdst, r->cmask,
-                        r->sp, r->ctl, r->f0, r->f1, r->t0, r->t0f, r->t1, r->t1f);
+                        r->sp, r->ctl, r->f0, r->f1, r->t0, r->t0f, r->t1, r->t1f,
+                        r->t2, r->t2f, r->t3, r->t3f);
             }
             /* Full combiner state of the modulate passes (DST_COLOR/SRC_COLOR),
              * with vertex 0's colour and texture coordinate. */
@@ -3136,10 +3143,14 @@ void vkb_request_cyan_capture(void)
     InterlockedExchange(&s_cyan_request, 1);
 }
 
+/* The far-terrain tint is not saturated cyan but olive gone teal: blue up
+ * near green and clearly above red (normal foliage 54,59,33; the tinted
+ * patches 44,63,60 and 48,58,51). Bright HUD green (26,106,55) and the
+ * yellow-grey sky stay out. */
 static int is_cyan(const uint8_t *bgra)
 {
     int bb = bgra[0], gg = bgra[1], rr = bgra[2];
-    return gg + bb > 60 && 2 * rr < gg && 2 * rr < bb;
+    return gg > 30 && bb >= rr + 8 && 100 * bb >= 80 * gg && bb <= gg + 20;
 }
 
 static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
