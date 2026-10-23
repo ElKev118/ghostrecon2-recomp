@@ -55,6 +55,21 @@ gr2.ini only exists once the menu has saved; then it wins over the
 launcher's variables. Test scripts set RECOMP_NO_INI=1.
 RECOMP_MENU_OPEN=1 starts with the menu open (screenshots / tests).
 
-Next: internal resolution (renderer work: scale render targets, viewports,
-surface copies), gamepad navigation of the menu (SDL game controller
-subsystem), then FSR / SMAA (step 3).
+Internal resolution DONE 2026-10-23 (game e420b43): menu presets 1x..5x
+(x2.25 = 1080p, x3 = 1440p, x4.5 = 2880x2160 "4K"), gr2.ini [Display]
+RenderScale, RECOMP_RENDER_SCALE; live (surfaces remade at the next
+present). Surfaces keep title-pixel sizes (w, h) plus image sizes (iw, ih)
+and their own scale (sc); viewport/scissor/clear/copies/present use the
+image. Lookup tables (surfaces read by a dependent AR/GB stage) stay 1x:
+scaled, GR2's grade table lost its first row/column (quad edge on the
+texel centre) and dark colours went cyan -- likely xemu's upscaling cyan
+too. Forest, 4.5x: ~145 FPS (CPU-bound as at 1x), GPU 3.9 ms a frame.
+Also: the pointer hides after 2 s idle over the window.
+Known: the window's downscale of a frame bigger than the window is one
+bilinear blit (some shimmer at 4x+ on a small window) -- SMAA/FSR step.
+Known: F7 (and RECOMP_VK_DUMP) stall the GPU; pressed during a mission
+load, the title can hang on a black screen. Debug-only; gate them behind
+DebugKeys before release.
+
+Next: gamepad navigation of the menu (SDL game controller subsystem), then
+FSR / SMAA (step 3).
