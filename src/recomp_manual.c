@@ -85,17 +85,64 @@ extern ptrdiff_t g_xbox_mem_offset;
  *       g_eax = result;
  *   }
  */
+/* RECOMP_ICALL_TOP=1: once a second, the indirect-call targets called most
+ * since the last report. A guest thread spinning on a status method (a wait
+ * loop that never sees the state it wants) is the one at the top. */
+#include <windows.h>
+#include <stdlib.h>
+#define ICALL_TOP_SLOTS 4096
+static volatile LONG s_itop_va[ICALL_TOP_SLOTS];
+static volatile LONG s_itop_n[ICALL_TOP_SLOTS];
+
+static void icall_top(uint32_t va)
+{
+    static int on = -1;
+    static DWORD last;
+    uint32_t h = (va * 2654435761u) >> 20, i;
+
+    if (on < 0)
+        on = getenv("RECOMP_ICALL_TOP") != NULL;
+    if (!on)
+        return;
+    for (i = 0; i < 8; i++) {
+        uint32_t k = (h + i) & (ICALL_TOP_SLOTS - 1);
+        LONG cur = s_itop_va[k];
+        if (cur == (LONG)va
+            || (cur == 0 && InterlockedCompareExchange(&s_itop_va[k], (LONG)va, 0) == 0)
+            || s_itop_va[k] == (LONG)va) {
+            InterlockedIncrement(&s_itop_n[k]);
+            break;
+        }
+    }
+    if (GetTickCount() - last >= 1000) {
+        uint32_t best[6] = {0}, bn[6] = {0}, j, m;
+        static uint32_t lo = 1, hi = 0;
+        if (hi == 0) {
+            const char *r = getenv("RECOMP_ICALL_TOP");
+            lo = (uint32_t)strtoul(r, (char **)&r, 16);
+            hi = (*r == '-') ? (uint32_t)strtoul(r + 1, NULL, 16) : 0xFFFFFFFFu;
+        }
+        last = GetTickCount();
+        for (i = 0; i < ICALL_TOP_SLOTS; i++) {
+            uint32_t n = (uint32_t)InterlockedExchange(&s_itop_n[i], 0);
+            if ((uint32_t)s_itop_va[i] < lo || (uint32_t)s_itop_va[i] > hi) continue;
+            for (j = 0; j < 6; j++)
+                if (n > bn[j]) {
+                    for (m = 5; m > j; m--) { bn[m] = bn[m - 1]; best[m] = best[m - 1]; }
+                    bn[j] = n; best[j] = (uint32_t)s_itop_va[i];
+                    break;
+                }
+        }
+        fprintf(stderr, "[ICALL-TOP]");
+        for (j = 0; j < 6 && bn[j]; j++)
+            fprintf(stderr, " %08X x%u", best[j], bn[j]);
+        fprintf(stderr, "\n");
+    }
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    /*
-     * TODO: Add your overrides here. Examples:
-     *
-     * if (xbox_va == 0x00012345) return traced_sub_00012345;
-     * if (xbox_va == 0x00067890) return stub_00067890;
-     * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
-     */
-
-    (void)xbox_va;
+    icall_top(xbox_va);
     return (recomp_func_t)0;
 }
 
