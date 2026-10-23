@@ -19,6 +19,8 @@
 extern "C" {
 #include "port_menu.h"
 #include "port_settings.h"
+#include "vk_glsl.h"
+extern void vkb_pipeline_cache_forget(void);
 extern void xbox_InputSetBlocked(int blocked);
 extern void xbox_InputKeysClear(void);
 }
@@ -200,6 +202,26 @@ static void panel(void)
         ImGui::BeginDisabled();
         ImGui::TextUnformatted("Internal resolution: native (scaling comes next)");
         ImGui::EndDisabled();
+
+        bool sc = s->shader_cache != 0;
+        if (ImGui::Checkbox("Shader cache", &sc)) {
+            s->shader_cache = sc;
+            vkg_set_cache_enabled(sc);
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keep compiled shaders on disk, so effects seen before\n"
+                              "do not stutter the next time the game runs.");
+        ImGui::SameLine();
+        static int s_cleared = -1;
+        if (ImGui::Button("Clear shader cache")) {
+            s_cleared = vkg_cache_clear();
+            vkb_pipeline_cache_forget();
+        }
+        if (s_cleared >= 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d files removed", s_cleared);
+        }
     }
 
     if (ImGui::CollapsingHeader("Audio", ImGuiTreeNodeFlags_DefaultOpen)) {

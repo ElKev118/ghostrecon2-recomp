@@ -1353,6 +1353,15 @@ static void pcache_init(void)
     free(data);
 }
 
+/* The cache was cleared from the menu: what this session's cache holds is
+ * what was just deleted, so do not write it back. */
+static volatile int s_pcache_forgotten;
+
+void vkb_pipeline_cache_forget(void)
+{
+    s_pcache_forgotten = 1;
+}
+
 static void pcache_save(void)
 {
     size_t n = 0;
@@ -1360,7 +1369,7 @@ static void pcache_save(void)
     char path[MAX_PATH], tmp[MAX_PATH + 8];
     FILE *f;
 
-    if (!s_pcache || !vkg_cache_dir()[0]
+    if (!s_pcache || !vkg_cache_dir()[0] || s_pcache_forgotten
         || vkGetPipelineCacheData(B.dev, s_pcache, &n, NULL) != VK_SUCCESS || !n)
         return;
     if (!(data = malloc(n)))

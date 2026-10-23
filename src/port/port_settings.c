@@ -67,6 +67,8 @@ void port_settings_startup(void)
     s_cur.volume = xbox_AudioGetVolume();
     s_cur.reverb = xbox_AudioGetReverb();
     s_cur.language = env_int("RECOMP_LANGUAGE", 1);
+    s_cur.shader_cache = !(getenv("RECOMP_SHADER_CACHE")
+                           && getenv("RECOMP_SHADER_CACHE")[0] == '0');
 
     if (use_ini) {
         char buf[16];
@@ -77,6 +79,8 @@ void port_settings_startup(void)
         s_cur.volume      = ini_int("Audio", "Volume", s_cur.volume);
         s_cur.reverb      = ini_float("Audio", "Reverb", s_cur.reverb);
         s_cur.language    = ini_int("Game", "Language", s_cur.language);
+        s_cur.shader_cache = ini_int("Display", "ShaderCache", s_cur.shader_cache);
+        _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
 
         /* Read once by the window and the kernel at their own start. */
         _putenv(s_cur.vsync ? "RECOMP_PRESENT_VSYNC=1" : "RECOMP_PRESENT_VSYNC=0");
@@ -117,6 +121,7 @@ int port_settings_save(void)
 
     snprintf(b, sizeof b, "%d", s_cur.window_mode); ok &= put("Display", "WindowMode", b);
     snprintf(b, sizeof b, "%d", s_cur.vsync);       ok &= put("Display", "VSync", b);
+    snprintf(b, sizeof b, "%d", s_cur.shader_cache); ok &= put("Display", "ShaderCache", b);
     snprintf(b, sizeof b, "%.3f", s_cur.frame_ms);  ok &= put("Display", "FrameLimitMs", b);
     snprintf(b, sizeof b, "%d", s_cur.volume);      ok &= put("Audio", "Volume", b);
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);

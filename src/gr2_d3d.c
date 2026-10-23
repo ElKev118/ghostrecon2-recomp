@@ -26,7 +26,7 @@
 #include <windows.h>
 
 #define GR2_D3D_DEVICE_PTR   0x0043A1B8u
-#define GR2_FENCE_WAIT_MS    250
+#define GR2_FENCE_WAIT_MS    2000   /* with no GPU progress at all */
 
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
@@ -128,15 +128,28 @@ void sub_0042F970(void)
             s_in_kick = 0;
         }
 
+        /* Give up only when the GPU has stopped: GR2_FENCE_WAIT_MS with its
+         * read pointer not moving. A fixed 250 ms from the start gave up on
+         * a GPU that was merely busy -- the executor compiling a new vertex
+         * program or pipeline can take that long -- and the title then
+         * rewrote vertex buffers and pushbuffer the GPU had not read yet:
+         * a frame of exploded vertices and wrong colours, at the moments
+         * new effects first appeared. */
         DWORD start = GetTickCount();
+        uint32_t last_read = MEM32(MEM32(dev + 0x30));
         while (!gr2_fence_passed(dev, fence)) {
+            uint32_t rd = MEM32(MEM32(dev + 0x30));
+            if (rd != last_read) {
+                last_read = rd;
+                start = GetTickCount();          /* still moving: keep waiting */
+            }
             if (GetTickCount() - start >= GR2_FENCE_WAIT_MS) {
                 static int warned;
                 static unsigned timeouts;
                 if (++timeouts % 50 == 0)
                     fprintf(stderr, "  [D3D] %u fence waits timed out so far\n", timeouts);
                 if (warned++ < 8) {
-                    fprintf(stderr, "  [D3D] fence 0x%08X not reached after %d ms "
+                    fprintf(stderr, "  [D3D] fence 0x%08X not reached: GPU idle for %d ms "
                             "(write=0x%08X gpu=0x%08X)\n", fence, GR2_FENCE_WAIT_MS,
                             MEM32(dev + 0x2C), MEM32(MEM32(dev + 0x30)));
                     fflush(stderr);

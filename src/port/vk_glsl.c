@@ -35,24 +35,68 @@ static uint64_t fnv1a64(const void *p, size_t n, uint64_t h)
     return h;
 }
 
-const char *vkg_cache_dir(void)
+static char s_dir[MAX_PATH];
+static volatile int s_cache_on = -1;     /* -1: not decided (RECOMP_SHADER_CACHE) */
+
+static const char *cache_root(void)
 {
-    static char dir[MAX_PATH];
     static int done;
 
     if (!done) {
-        const char *off = getenv("RECOMP_SHADER_CACHE");
         const char *base = getenv("LOCALAPPDATA");
         done = 1;
-        if ((off && off[0] == '0') || !base)
-            return dir;
-        snprintf(dir, sizeof dir, "%s\\GhostRecon2", base);
-        CreateDirectoryA(dir, NULL);
-        snprintf(dir, sizeof dir, "%s\\GhostRecon2\\shadercache", base);
-        if (!CreateDirectoryA(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-            dir[0] = 0;
+        if (!base)
+            return s_dir;
+        snprintf(s_dir, sizeof s_dir, "%s\\GhostRecon2", base);
+        CreateDirectoryA(s_dir, NULL);
+        snprintf(s_dir, sizeof s_dir, "%s\\GhostRecon2\\shadercache", base);
+        if (!CreateDirectoryA(s_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+            s_dir[0] = 0;
     }
-    return dir;
+    return s_dir;
+}
+
+int vkg_cache_enabled(void)
+{
+    if (s_cache_on < 0) {
+        const char *off = getenv("RECOMP_SHADER_CACHE");
+        s_cache_on = !(off && off[0] == '0');
+    }
+    return s_cache_on;
+}
+
+void vkg_set_cache_enabled(int on)
+{
+    s_cache_on = on != 0;
+}
+
+const char *vkg_cache_dir(void)
+{
+    return vkg_cache_enabled() ? cache_root() : "";
+}
+
+int vkg_cache_clear(void)
+{
+    char pat[MAX_PATH + 8], path[MAX_PATH * 2];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int n = 0;
+
+    if (!cache_root()[0])
+        return 0;
+    snprintf(pat, sizeof pat, "%s\\*", s_dir);
+    if ((h = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        snprintf(path, sizeof path, "%s\\%s", s_dir, fd.cFileName);
+        if (DeleteFileA(path))
+            n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    fprintf(stderr, "[VKG] shader cache cleared: %d files\n", n);
+    return n;
 }
 
 static void cache_path(char *out, size_t n, const char *src, int fragment)

@@ -23,6 +23,7 @@ typedef struct {
     int   volume;          /* 0..100 */
     float reverb;          /* reverb send, 0..0.5 */
     int   language;        /* console code: 1 en, 3 de, 4 fr, 5 es, 6 it */
+    int   shader_cache;    /* 0/1: keep compiled shaders on disk */
 } PortSettings;
 
 /* Read gr2.ini (if any) and push what must be in place before the guest
