@@ -337,6 +337,15 @@ RECOMP_TRACE_TIMES=4C039E,4C31BD (timed calls, APU clock).
 
 ## Mission 2 (s02 pagoda) metallic sound -- OPTIONAL, tolerable (2026-10-22)
 
+LIKELY SOLVED 2026-10-23 (toolkit 001b61a, 7004463; awaiting the user's
+ear): the rate=24 voices are rumble recorded at 2 kHz, stretched 24x by
+the VP's linear interpolation, which leaves images every 2 kHz (an F6
+capture: a burst at 3996/5765 Hz). The LFE bin is now low-passed at 120 Hz
+before the stereo downmix, and every voice upsampled 1.5x or more is
+low-passed at 0.45 of its own sample rate. The saturation in combat was
+the mix at 3-8x full scale through a per-sample soft clip: now a -6 dB
+master gain and a smooth limiter (9103a07). Notes below kept for history.
+
 User report: in mission 2 (rain) there is, besides the rain and the voices
 (both fine), a strange metallic sound, "like iron rods knocking". Not in
 xemu. The user rates it tolerable: revisit at the end, optional.
