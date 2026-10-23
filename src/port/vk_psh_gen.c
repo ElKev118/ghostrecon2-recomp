@@ -161,7 +161,7 @@ size_t vk_psh_gen(const uint32_t *spec, int zofs, char *buf, size_t cap)
     put(&g, "void main() {\n");
     if (zofs)
         put(&g, "  float zu = gl_FragCoord.z / pc.surf.z;\n"
-                "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu)));\n");
+                "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu))) * max(pc.surf.w, 1.0);\n");
     put(&g, "  vec4 c;\n");
     if (!spec[35]) {
         /* No combiner state yet: texture 0 times diffuse. */

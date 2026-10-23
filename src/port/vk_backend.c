@@ -44,7 +44,9 @@
 typedef struct {
     uint32_t va;                /* guest address (low 28 bits compared) */
     int      depth;             /* depth/stencil target */
-    uint32_t w, h;
+    uint32_t w, h;              /* in the title's pixels */
+    uint32_t iw, ih;            /* the image's: w, h at the internal resolution */
+    float    sc;                /* that resolution: s_scale, or 1 for a lookup table */
     VkImage  img;
     VkDeviceMemory mem;
     VkImageView view;
@@ -190,6 +192,72 @@ static struct {
 } B;
 
 static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
+
+/* Internal resolution: every surface's image is the title's size times
+ * s_scale. Coordinates stay in the title's pixels everywhere (vertices,
+ * clip and clear boxes, blits, texture sizes); only what addresses the
+ * images -- viewport, scissor, clear rects, copies -- is scaled. A change
+ * (vkb_set_render_scale, the options menu) takes effect at the next
+ * present, by recreating the surfaces. */
+static float s_scale = 1.0f;
+static volatile LONG s_scale_req;      /* requested scale x 100, 0: none */
+
+void vkb_set_render_scale(float scale)
+{
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 6.0f) scale = 6.0f;
+    InterlockedExchange(&s_scale_req, (LONG)(scale * 100.0f + 0.5f));
+}
+
+float vkb_get_render_scale(void)
+{
+    LONG r = s_scale_req;
+    return r ? (float)r / 100.0f : s_scale;
+}
+
+/* A title pixel count in the image of surface s. */
+static uint32_t SCs(const void *s, uint32_t v);
+
+/* Lookup tables stay at the title's resolution. Ghost Recon 2 draws its
+ * 256x256 colour-grade table with a quad whose edges sit on the first
+ * texel's centre: one texel covered at 640x480, but scaled up the first row
+ * and column of image pixels fall outside it and stay black. The grade
+ * pass reads the table by (alpha, red) -- alpha 0 everywhere -- so it read
+ * that black column, and dark colours lost their red: cyan trunks and
+ * ridges. A surface some draw reads with a dependent texture lookup (stage
+ * program AR / GB) is such a table; it is remembered by address and width,
+ * dropped at the next present and made again at scale 1. */
+#define VKB_MAX_LUTS 16
+static struct { uint32_t va, w; } s_luts[VKB_MAX_LUTS];
+static int s_nluts;
+static volatile int s_luts_retire;
+
+static int is_lut(uint32_t va, uint32_t w)
+{
+    int i;
+    for (i = 0; i < s_nluts; i++)
+        if (s_luts[i].va == va && s_luts[i].w == w)
+            return 1;
+    return 0;
+}
+
+static uint32_t SCs(const void *sv, uint32_t v)
+{
+    const Surface *s = (const Surface *)sv;
+    return (uint32_t)((float)v * s->sc + 0.5f);
+}
+
+static void mark_lut(const Surface *s)
+{
+    if (s->sc == 1.0f || is_lut(s->va, s->w) || s_nluts >= VKB_MAX_LUTS)
+        return;
+    s_luts[s_nluts].va = s->va;
+    s_luts[s_nluts].w = s->w;
+    s_nluts++;
+    s_luts_retire = 1;
+    fprintf(stderr, "[VKB] surface %08X %ux%u is a lookup table: kept at 1x\n",
+            s->va, s->w, s->h);
+}
 
 /* Per-present statistics: fence waits in begin_frame, submits, uploads. */
 static long long s_stat_wait;
@@ -462,7 +530,8 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
         }
     }
     s = &B.surf[slot];
-    if (!make_image(w, h, depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
+    s->sc = !depth && is_lut(va_key(va), w) ? 1.0f : s_scale;
+    if (!make_image(SCs(s, w), SCs(s, h), depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
                     depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                           : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
@@ -477,13 +546,15 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
     s->depth = depth;
     s->w = w;
     s->h = h;
+    s->iw = SCs(s, w);
+    s->ih = SCs(s, h);
     s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     s->last_used = B.frame_no;
     {
         static unsigned said;
         if (said++ < 40)
-            fprintf(stderr, "[VKB] new %s surface %08X %ux%u\n",
-                    depth ? "depth" : "colour", va, w, h);
+            fprintf(stderr, "[VKB] new %s surface %08X %ux%u (image %ux%u)\n",
+                    depth ? "depth" : "colour", va, w, h, s->iw, s->ih);
     }
     /* Start from black / far, as a fresh surface reads in guest memory. */
     {
@@ -545,8 +616,8 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
     ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    ri.renderArea.extent.width = c->w;
-    ri.renderArea.extent.height = c->h;
+    ri.renderArea.extent.width = c->iw;
+    ri.renderArea.extent.height = c->ih;
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
@@ -555,9 +626,9 @@ static int bind_target(const Nv2aSurface *sf, uint32_t zeta_va)
         da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (d->w < c->w || d->h < c->h) {
-            ri.renderArea.extent.width = d->w < c->w ? d->w : c->w;
-            ri.renderArea.extent.height = d->h < c->h ? d->h : c->h;
+        if (d->iw < c->iw || d->ih < c->ih) {
+            ri.renderArea.extent.width = d->iw < c->iw ? d->iw : c->iw;
+            ri.renderArea.extent.height = d->ih < c->ih ? d->ih : c->ih;
         }
         ri.pDepthAttachment = &da;
         ri.pStencilAttachment = &da;
@@ -739,6 +810,7 @@ static int upload_texture(Tex *t, const Nv2aTexture *src)
  * draws its 256x256 grade table into an address it also uses as a 640x480
  * buffer), so coordinates must be scaled to the part that holds the data. */
 static uint32_t s_view_w, s_view_h;
+static const Surface *s_view_surf;     /* the colour surface texture_view sampled */
 /* RECOMP_VK_PROBE: 1 = flag file seen, 2 = a present happened since,
  * 3 = probing, 4 = the probed frame was presented. */
 static int s_probe_armed;
@@ -825,7 +897,7 @@ static VkImageView texture_view(const Nv2aTexStage *st)
              * cannot sample an attachment it writes, so sample a copy. */
             static Surface copy;
             VkImageCopy rgn;
-            if (!copy.img || copy.w != s->w || copy.h != s->h) {
+            if (!copy.img || copy.iw != s->iw || copy.ih != s->ih) {
                 if (copy.img) {
                     vkDeviceWaitIdle(B.dev);
                     vkDestroyImageView(B.dev, copy.view, NULL);
@@ -833,11 +905,12 @@ static VkImageView texture_view(const Nv2aTexStage *st)
                     vkFreeMemory(B.dev, copy.mem, NULL);
                 }
                 memset(&copy, 0, sizeof copy);
-                if (!make_image(s->w, s->h, VK_FORMAT_B8G8R8A8_UNORM,
+                if (!make_image(s->iw, s->ih, VK_FORMAT_B8G8R8A8_UNORM,
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 0, &copy.img, &copy.mem, &copy.view))
                     return NULL;
                 copy.w = s->w; copy.h = s->h;
+                copy.iw = s->iw; copy.ih = s->ih;
                 copy.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             }
             to_layout(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -846,8 +919,8 @@ static VkImageView texture_view(const Nv2aTexStage *st)
             rgn.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             rgn.srcSubresource.layerCount = 1;
             rgn.dstSubresource = rgn.srcSubresource;
-            rgn.extent.width = s->w;
-            rgn.extent.height = s->h;
+            rgn.extent.width = s->iw;
+            rgn.extent.height = s->ih;
             rgn.extent.depth = 1;
             s_stat_copies++;
             vkCmdCopyImage(cur()->cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -861,6 +934,7 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         }
         to_layout(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         s_view_w = s->w; s_view_h = s->h;
+        s_view_surf = s;
         return s->view;
     }
 
@@ -1181,7 +1255,7 @@ static const char *FS_SRC =
      * keeps early depth testing. */
     "#ifdef ZOFS\n"
     "  float zu = gl_FragCoord.z / pc.surf.z;\n"
-    "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu)));\n"
+    "  float zsl = max(abs(dFdx(zu)), abs(dFdy(zu))) * max(pc.surf.w, 1.0);\n"
     "#endif\n"
     "  vec4 c;\n"
     "  if (SC_CTL.w == 0u) {\n"
@@ -1326,7 +1400,7 @@ static volatile LONG64 s_pipe_us;
 
 static void pcache_path(char *out, size_t n)
 {
-    snprintf(out, n, "%s\pipelines.bin", vkg_cache_dir());
+    snprintf(out, n, "%s\\pipelines.bin", vkg_cache_dir());
 }
 
 static void pcache_init(void)
@@ -1790,6 +1864,11 @@ static int init(void)
     if (tried)
         return 0;
     tried = 1;
+    if (s_scale_req) {                 /* the setting at start: no surfaces yet */
+        s_scale = (float)InterlockedExchange(&s_scale_req, 0) / 100.0f;
+        fprintf(stderr, "[VKB] internal resolution x%.2f (640x480 -> %ux%u)\n", s_scale,
+                (unsigned)(640 * s_scale + 0.5f), (unsigned)(480 * s_scale + 0.5f));
+    }
     B.c = vkw_wait_ready(10000);
     if (!B.c) {
         fprintf(stderr, "[VKB] no Vulkan window; renderer off\n");
@@ -2045,7 +2124,13 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         VkImageView view;
         s_view_w = s_view_h = 0;
         s_view_depth = 0;
+        s_view_surf = NULL;
         view = stages ? texture_view(&stages[st]) : NULL;
+        if (s_view_surf && px) {
+            uint32_t prog = (px->stage_program >> (5 * st)) & 31u;
+            if (prog == 0x0F || prog == 0x10)          /* dependent AR / GB */
+                mark_lut(s_view_surf);
+        }
         if (stages && stages[st].enabled && is_depth_format(stages[st].t.color)) {
             static unsigned said;
             if (said++ < 40)
@@ -2317,6 +2402,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     pc.surf[0] = (float)B.rt_color->w;
     pc.surf[1] = (float)B.rt_color->h;
     pc.surf[2] = zmax > 0.0f ? 1.0f / zmax : 1.0f;
+    pc.surf[3] = B.rt_color->sc;       /* the polygon offset's slope is per title pixel */
     pc.alpha[0] = (int32_t)rs->alpha_test_enable;
     pc.alpha[1] = (int32_t)rs->alpha_func;
     pc.alpha[2] = (int32_t)(rs->alpha_ref & 0xFF);
@@ -2387,8 +2473,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         s_cs.have_pc = 1;
     }
     memset(&vp, 0, sizeof vp);
-    vp.width = (float)B.rt_color->w;
-    vp.height = (float)B.rt_color->h;
+    vp.width = (float)B.rt_color->iw;
+    vp.height = (float)B.rt_color->ih;
     vp.maxDepth = 1.0f;
     /* Scissor = the surface clip box, origin included (xemu draw.c). */
     {
@@ -2397,10 +2483,11 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         uint32_t x1 = sf->clip_x + sf->width, y1 = sf->clip_y + sf->height;
         if (x1 > B.rt_color->w) x1 = B.rt_color->w;
         if (y1 > B.rt_color->h) y1 = B.rt_color->h;
-        sc.offset.x = (int32_t)x0;
-        sc.offset.y = (int32_t)y0;
-        sc.extent.width = x1 > x0 ? x1 - x0 : 0;
-        sc.extent.height = y1 > y0 ? y1 - y0 : 0;
+        const Surface *t = B.rt_color;
+        sc.offset.x = (int32_t)SCs(t, x0);
+        sc.offset.y = (int32_t)SCs(t, y0);
+        sc.extent.width = x1 > x0 ? SCs(t, x1) - SCs(t, x0) : 0;
+        sc.extent.height = y1 > y0 ? SCs(t, y1) - SCs(t, y0) : 0;
     }
     {
         /* RECOMP_VK_TINY=1: a 1x1 scissor -- the frame without its pixel
@@ -2523,7 +2610,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                                                  &s_probe_buf, &s_probe_mem, (void **)&s_probe_map))
                     done = 1;
                 if (!done) {
-                    r->ok = t->w >= PROBE_R && t->h >= PROBE_R;
+                    r->ok = t->iw >= PROBE_R && t->ih >= PROBE_R;
                     r->surf = t->va; r->count = count;
                     r->blend = rs->blend_enable; r->bsrc = rs->blend_src; r->bdst = rs->blend_dst;
                     r->cmask = rs->color_mask;
@@ -2546,8 +2633,8 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
                             int x0 = s_probe_px[p] - PROBE_R / 2, y0 = s_probe_py[p] - PROBE_R / 2;
                             if (x0 < 0) x0 = 0;
                             if (y0 < 0) y0 = 0;
-                            if (x0 + PROBE_R > (int)t->w) x0 = (int)t->w - PROBE_R;
-                            if (y0 + PROBE_R > (int)t->h) y0 = (int)t->h - PROBE_R;
+                            if (x0 + PROBE_R > (int)t->iw) x0 = (int)t->iw - PROBE_R;
+                            if (y0 + PROBE_R > (int)t->ih) y0 = (int)t->ih - PROBE_R;
                             memset(&c, 0, sizeof c);
                             c.bufferOffset = ((VkDeviceSize)idx * PROBE_PTS + p) * PROBE_R * PROBE_R * 4;
                             c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2885,10 +2972,10 @@ static void vkb_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (y1 > B.rt_color->h) y1 = B.rt_color->h;
         if (x0 >= x1 || y0 >= y1)
             return;
-        rect.rect.offset.x = (int32_t)x0;
-        rect.rect.offset.y = (int32_t)y0;
-        rect.rect.extent.width = x1 - x0;
-        rect.rect.extent.height = y1 - y0;
+        rect.rect.offset.x = (int32_t)SCs(B.rt_color, x0);
+        rect.rect.offset.y = (int32_t)SCs(B.rt_color, y0);
+        rect.rect.extent.width = SCs(B.rt_color, x1) - SCs(B.rt_color, x0);
+        rect.rect.extent.height = SCs(B.rt_color, y1) - SCs(B.rt_color, y0);
     }
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;
@@ -2926,10 +3013,34 @@ static int vkb_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
     rgn.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     rgn.srcSubresource.layerCount = 1;
     rgn.dstSubresource = rgn.srcSubresource;
-    rgn.srcOffset.x = (int32_t)sx; rgn.srcOffset.y = (int32_t)sy;
-    rgn.dstOffset.x = (int32_t)dx; rgn.dstOffset.y = (int32_t)dy;
-    rgn.extent.width = w < s->w - sx ? w : s->w - sx;
-    rgn.extent.height = h < s->h - sy ? h : s->h - sy;
+    if (sx >= s->w || sy >= s->h)
+        return 1;
+    if (w > s->w - sx) w = s->w - sx;
+    if (h > s->h - sy) h = s->h - sy;
+    if (s->sc != d->sc) {
+        /* One side is a 1x lookup table: scale the copy. */
+        VkImageBlit bl;
+        memset(&bl, 0, sizeof bl);
+        bl.srcSubresource = rgn.srcSubresource;
+        bl.dstSubresource = rgn.dstSubresource;
+        bl.srcOffsets[0].x = (int32_t)SCs(s, sx); bl.srcOffsets[0].y = (int32_t)SCs(s, sy);
+        bl.srcOffsets[1].x = (int32_t)SCs(s, sx + w); bl.srcOffsets[1].y = (int32_t)SCs(s, sy + h);
+        bl.srcOffsets[1].z = 1;
+        bl.dstOffsets[0].x = (int32_t)SCs(d, dx); bl.dstOffsets[0].y = (int32_t)SCs(d, dy);
+        bl.dstOffsets[1].x = (int32_t)SCs(d, dx + w); bl.dstOffsets[1].y = (int32_t)SCs(d, dy + h);
+        bl.dstOffsets[1].z = 1;
+        if ((uint32_t)bl.dstOffsets[1].x > d->iw) bl.dstOffsets[1].x = (int32_t)d->iw;
+        if ((uint32_t)bl.dstOffsets[1].y > d->ih) bl.dstOffsets[1].y = (int32_t)d->ih;
+        vkCmdBlitImage(cur()->cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+        return 1;
+    }
+    rgn.srcOffset.x = (int32_t)SCs(s, sx); rgn.srcOffset.y = (int32_t)SCs(s, sy);
+    rgn.dstOffset.x = (int32_t)SCs(d, dx); rgn.dstOffset.y = (int32_t)SCs(d, dy);
+    rgn.extent.width = SCs(s, sx + w) - SCs(s, sx);
+    rgn.extent.height = SCs(s, sy + h) - SCs(s, sy);
+    if (rgn.dstOffset.x + rgn.extent.width > d->iw) rgn.extent.width = d->iw - rgn.dstOffset.x;
+    if (rgn.dstOffset.y + rgn.extent.height > d->ih) rgn.extent.height = d->ih - rgn.dstOffset.y;
     rgn.extent.depth = 1;
     vkCmdCopyImage(cur()->cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
@@ -3014,7 +3125,7 @@ static void dump_surfaces(const char *prefix, unsigned shot)
 
         if (!sf->img)
             continue;
-        if (!make_buffer((VkDeviceSize)sf->w * sf->h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        if (!make_buffer((VkDeviceSize)sf->iw * sf->ih * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                          &buf, &mem, (void **)&map))
             return;
         begin_frame();
@@ -3026,12 +3137,12 @@ static void dump_surfaces(const char *prefix, unsigned shot)
             memset(&c, 0, sizeof c);
             c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
             c.imageSubresource.layerCount = 1;
-            c.imageExtent.width = sf->w; c.imageExtent.height = sf->h; c.imageExtent.depth = 1;
+            c.imageExtent.width = sf->iw; c.imageExtent.height = sf->ih; c.imageExtent.depth = 1;
             vkCmdCopyImageToBuffer(cur()->cmd, sf->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    buf, 1, &c);
             submit_frame();
             vkDeviceWaitIdle(B.dev);
-            n = (size_t)sf->w * sf->h;
+            n = (size_t)sf->iw * sf->ih;
             for (k = 0; k < n; k++) {
                 float v = z[k];
                 uint8_t g;
@@ -3042,7 +3153,7 @@ static void dump_surfaces(const char *prefix, unsigned shot)
                 map[k * 4] = map[k * 4 + 1] = map[k * 4 + 2] = g; map[k * 4 + 3] = 255;
             }
             snprintf(path, sizeof path, "%s%04u_%08X_w%u_z.bmp", prefix, shot, sf->va, sf->w);
-            write_bmp(path, map, sf->w, sf->h);
+            write_bmp(path, map, sf->iw, sf->ih);
             fprintf(stderr, "[VKB] depth %08X %ux%u: min %.6f (%.0f) max %.6f (%.0f), %zu of %zu far\n",
                     sf->va, sf->w, sf->h, lo, lo * 65535.0f, hi, hi * 65535.0f, nfar, n);
             vkDestroyBuffer(B.dev, buf, NULL);
@@ -3052,20 +3163,20 @@ static void dump_surfaces(const char *prefix, unsigned shot)
         memset(&c, 0, sizeof c);
         c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         c.imageSubresource.layerCount = 1;
-        c.imageExtent.width = sf->w;
-        c.imageExtent.height = sf->h;
+        c.imageExtent.width = sf->iw;
+        c.imageExtent.height = sf->ih;
         c.imageExtent.depth = 1;
         vkCmdCopyImageToBuffer(cur()->cmd, sf->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                buf, 1, &c);
         submit_frame();
         vkDeviceWaitIdle(B.dev);
         snprintf(path, sizeof path, "%s%04u_%08X_w%u.bmp", prefix, shot, sf->va, sf->w);
-        write_bmp(path, map, sf->w, sf->h);
-        n = (size_t)sf->w * sf->h;
+        write_bmp(path, map, sf->iw, sf->ih);
+        n = (size_t)sf->iw * sf->ih;
         for (k = 0; k < n; k++)
             map[k * 4] = map[k * 4 + 1] = map[k * 4 + 2] = map[k * 4 + 3];
         snprintf(path, sizeof path, "%s%04u_%08X_w%u_a.bmp", prefix, shot, sf->va, sf->w);
-        write_bmp(path, map, sf->w, sf->h);
+        write_bmp(path, map, sf->iw, sf->ih);
         vkDestroyBuffer(B.dev, buf, NULL);
         vkFreeMemory(B.dev, mem, NULL);
     }
@@ -3160,6 +3271,9 @@ void vkb_request_cyan_capture(void)
 static int is_cyan(const uint8_t *bgra)
 {
     int bb = bgra[0], gg = bgra[1], rr = bgra[2];
+    /* Also dark teal with no red at all (0,28,30): red lost, not tinted. */
+    if (rr == 0 && gg >= 12 && bb >= 12 && bb <= gg + 20)
+        return 1;
     return gg > 30 && bb >= rr + 8 && 100 * bb >= 80 * gg && bb <= gg + 20;
 }
 
@@ -3192,6 +3306,8 @@ static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
     submit_frame();
     vkDeviceWaitIdle(B.dev);
 
+    if (getenv("RECOMP_VK_CYAN_SURFACES"))     /* every surface too, as it stands */
+        dump_surfaces("cyansurf_", shot);
     snprintf(path, sizeof path, "cyan%u_frame.bmp", shot);
     if ((f = fopen(path, "wb"))) {
         uint8_t hdr[54];
@@ -3261,8 +3377,73 @@ static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
     B.rt_color = NULL;
 }
 
+/* A new internal resolution: between frames, every surface goes (their
+ * images are the old size) and is made again at the new one by the next
+ * draw into it. What a surface held is lost -- a frame or so of black for
+ * anything the title does not redraw each frame. */
+static void apply_render_scale(void)
+{
+    LONG r = s_scale_req;
+    float want = (float)r / 100.0f;
+    int i;
+
+    if (!r)
+        return;
+    InterlockedExchange(&s_scale_req, 0);
+    if (want == s_scale)
+        return;
+    end_rendering();
+    submit_frame();
+    vkDeviceWaitIdle(B.dev);
+    for (i = 0; i < VKB_MAX_SURFACES; i++) {
+        Surface *s = &B.surf[i];
+        if (!s->img)
+            continue;
+        vkDestroyImageView(B.dev, s->view, NULL);
+        vkDestroyImage(B.dev, s->img, NULL);
+        vkFreeMemory(B.dev, s->mem, NULL);
+        memset(s, 0, sizeof *s);
+    }
+    B.rt_color = B.rt_depth = NULL;
+    fprintf(stderr, "[VKB] internal resolution x%.2f -> x%.2f (640x480 -> %ux%u)\n",
+            s_scale, want, (unsigned)(640 * want + 0.5f), (unsigned)(480 * want + 0.5f));
+    s_scale = want;
+}
+
+static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
+                              uint32_t aa_sx, uint32_t aa_sy);
+
 static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         uint32_t aa_sx, uint32_t aa_sy)
+{
+    vkb_present_frame(va, pitch, w, h, aa_sx, aa_sy);
+    if (s_scale_req && !B.failed)
+        apply_render_scale();
+    if (s_luts_retire && !B.failed) {
+        int i, any = 0;
+        s_luts_retire = 0;
+        for (i = 0; i < VKB_MAX_SURFACES; i++) {
+            Surface *t = &B.surf[i];
+            if (!t->img || t->depth || t->sc == 1.0f || !is_lut(t->va, t->w))
+                continue;
+            if (!any) {
+                end_rendering();
+                submit_frame();
+                vkDeviceWaitIdle(B.dev);
+                any = 1;
+            }
+            vkDestroyImageView(B.dev, t->view, NULL);
+            vkDestroyImage(B.dev, t->img, NULL);
+            vkFreeMemory(B.dev, t->mem, NULL);
+            memset(t, 0, sizeof *t);
+        }
+        if (any)
+            B.rt_color = B.rt_depth = NULL;
+    }
+}
+
+static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
+                              uint32_t aa_sx, uint32_t aa_sy)
 {
     s_presents++;
     if (s_probe_armed == 1 || s_probe_armed == 3)
@@ -3281,7 +3462,8 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
     begin_frame();
     if (s && w && h) {
         o = B.out_i ^ 1;
-        if (!B.out[o] || B.out_w[o] != w || B.out_h[o] != h) {
+        uint32_t ow = SCs(s, w), oh = SCs(s, h);
+        if (!B.out[o] || B.out_w[o] != ow || B.out_h[o] != oh) {
             if (B.out[o]) {
                 submit_frame();
                 vkDeviceWaitIdle(B.dev);
@@ -3289,12 +3471,12 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                 vkDestroyImage(B.dev, B.out[o], NULL);
                 vkFreeMemory(B.dev, B.out_mem[o], NULL);
             }
-            if (!make_image(w, h, VK_FORMAT_B8G8R8A8_UNORM,
+            if (!make_image(ow, oh, VK_FORMAT_B8G8R8A8_UNORM,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             0, &B.out[o], &B.out_mem[o], NULL))
                 return;
-            B.out_w[o] = w;
-            B.out_h[o] = h;
+            B.out_w[o] = ow;
+            B.out_h[o] = oh;
         }
         cmd = cur()->cmd;
         to_layout(s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -3303,11 +3485,11 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
         b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         b.srcSubresource.layerCount = 1;
         b.dstSubresource = b.srcSubresource;
-        b.srcOffsets[1].x = (int32_t)(w < s->w ? w : s->w);
-        b.srcOffsets[1].y = (int32_t)(h < s->h ? h : s->h);
+        b.srcOffsets[1].x = (int32_t)(ow < s->iw ? ow : s->iw);
+        b.srcOffsets[1].y = (int32_t)(oh < s->ih ? oh : s->ih);
         b.srcOffsets[1].z = 1;
-        b.dstOffsets[1].x = (int32_t)w;
-        b.dstOffsets[1].y = (int32_t)h;
+        b.dstOffsets[1].x = (int32_t)ow;
+        b.dstOffsets[1].y = (int32_t)oh;
         b.dstOffsets[1].z = 1;
         vkCmdBlitImage(cmd, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        B.out[o], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
@@ -3315,10 +3497,10 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         submit_frame();
         B.out_i = o;
-        vkw_set_gpu_frame(B.out[o], w, h);
-        dump_frame(B.out[o], w, h);
+        vkw_set_gpu_frame(B.out[o], ow, oh);
+        dump_frame(B.out[o], ow, oh);
         if (s_cyan_request && InterlockedExchange(&s_cyan_request, 0))
-            cyan_capture(B.out[o], w, h);
+            cyan_capture(B.out[o], ow, oh);
         {
             /* Frames presented, once a second: the window title says it too,
              * but a log outlives the window. */

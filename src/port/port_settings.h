@@ -25,6 +25,7 @@ typedef struct {
     float ambience;        /* level of sounds many voices share (rain), 0..1 */
     int   language;        /* console code: 1 en, 3 de, 4 fr, 5 es, 6 it */
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
+    float render_scale;    /* internal resolution, times 640x480 (1..5) */
 } PortSettings;
 
 /* Read gr2.ini (if any) and push what must be in place before the guest

@@ -17,6 +17,7 @@ extern float xbox_AudioGetReverb(void);
 extern void  xbox_AudioSetAmbience(float gain);
 extern float xbox_AudioGetAmbience(void);
 extern void  gr2_set_frame_ms(float ms);
+extern void  vkb_set_render_scale(float scale);
 extern float gr2_get_frame_ms(void);
 
 static PortSettings s_cur;
@@ -72,6 +73,8 @@ void port_settings_startup(void)
     s_cur.language = env_int("RECOMP_LANGUAGE", 1);
     s_cur.shader_cache = !(getenv("RECOMP_SHADER_CACHE")
                            && getenv("RECOMP_SHADER_CACHE")[0] == '0');
+    s_cur.render_scale = getenv("RECOMP_RENDER_SCALE")
+                       ? (float)atof(getenv("RECOMP_RENDER_SCALE")) : 1.0f;
 
     if (use_ini) {
         char buf[16];
@@ -84,6 +87,7 @@ void port_settings_startup(void)
         s_cur.ambience    = ini_float("Audio", "Ambience", s_cur.ambience);
         s_cur.language    = ini_int("Game", "Language", s_cur.language);
         s_cur.shader_cache = ini_int("Display", "ShaderCache", s_cur.shader_cache);
+        s_cur.render_scale = ini_float("Display", "RenderScale", s_cur.render_scale);
         _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
 
         /* Read once by the window and the kernel at their own start. */
@@ -94,6 +98,7 @@ void port_settings_startup(void)
         fprintf(stderr, "[PORT] settings from %s\n", s_path);
     }
     s_boot_language = s_cur.language;
+    vkb_set_render_scale(s_cur.render_scale);  /* ini or RECOMP_RENDER_SCALE */
 }
 
 PortSettings *port_settings(void)
@@ -112,6 +117,7 @@ void port_settings_apply_live(void)
     xbox_AudioSetReverb(s_cur.reverb);
     xbox_AudioSetAmbience(s_cur.ambience);
     gr2_set_frame_ms(s_cur.frame_ms);
+    vkb_set_render_scale(s_cur.render_scale);
 }
 
 static int put(const char *sec, const char *key, const char *val)
@@ -128,6 +134,7 @@ int port_settings_save(void)
     snprintf(b, sizeof b, "%d", s_cur.vsync);       ok &= put("Display", "VSync", b);
     snprintf(b, sizeof b, "%d", s_cur.shader_cache); ok &= put("Display", "ShaderCache", b);
     snprintf(b, sizeof b, "%.3f", s_cur.frame_ms);  ok &= put("Display", "FrameLimitMs", b);
+    snprintf(b, sizeof b, "%.2f", s_cur.render_scale); ok &= put("Display", "RenderScale", b);
     snprintf(b, sizeof b, "%d", s_cur.volume);      ok &= put("Audio", "Volume", b);
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);
     snprintf(b, sizeof b, "%.3f", s_cur.ambience);  ok &= put("Audio", "Ambience", b);

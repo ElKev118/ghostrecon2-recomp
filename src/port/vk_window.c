@@ -724,6 +724,8 @@ static int window_thread(void *unused)
     Uint32 last_title = SDL_GetTicks();
     unsigned flips_at_title = 0;
     int fullscreen = 0;
+    Uint32 last_mouse = SDL_GetTicks();
+    int cursor_shown = 1;
 
     (void)unused;
     if (scale < 1) scale = 1;
@@ -811,6 +813,9 @@ static int window_thread(void *unused)
                 xbox_AudioCapture();
                 continue;
             }
+            if (ev.type == SDL_MOUSEMOTION || ev.type == SDL_MOUSEBUTTONDOWN
+                || ev.type == SDL_MOUSEWHEEL)
+                last_mouse = SDL_GetTicks();
             if (pmenu_event(&ev))
                 continue;             /* the options menu's, not the game's */
             if (ev.type == SDL_QUIT) {
@@ -834,6 +839,16 @@ static int window_thread(void *unused)
                     || ev.window.event == SDL_WINDOWEVENT_RESIZED))
                 V.swap_dirty = 1;
             xbox_InputSdlEvent(&ev);
+        }
+
+        {
+            /* The pointer hides over the window after 2 s without moving,
+             * and comes back with the mouse or the options menu. */
+            int show = pmenu_is_open() || SDL_GetTicks() - last_mouse < 2000;
+            if (show != cursor_shown) {
+                SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
+                cursor_shown = show;
+            }
         }
 
         SDL_LockMutex(s_lock);

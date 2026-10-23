@@ -199,9 +199,33 @@ static void panel(void)
                 }
             ImGui::EndCombo();
         }
-        ImGui::BeginDisabled();
-        ImGui::TextUnformatted("Internal resolution: native (scaling comes next)");
-        ImGui::EndDisabled();
+        {
+            /* Times the console's 640x480; the window scales the result. */
+            static const struct { float scale; const char *name; } k_res[] = {
+                { 1.0f,  "Native (640x480)" },
+                { 1.5f,  "x1.5 (960x720, 720p)" },
+                { 2.0f,  "x2 (1280x960)" },
+                { 2.25f, "x2.25 (1440x1080, 1080p)" },
+                { 3.0f,  "x3 (1920x1440, 1440p)" },
+                { 4.0f,  "x4 (2560x1920)" },
+                { 4.5f,  "x4.5 (2880x2160, 4K)" },
+                { 5.0f,  "x5 (3200x2400)" },
+            };
+            int ri = 0;
+            for (int i = 0; i < (int)IM_ARRAYSIZE(k_res); i++)
+                if (k_res[i].scale <= s->render_scale + 0.01f) ri = i;
+            if (ImGui::BeginCombo("Internal resolution", k_res[ri].name)) {
+                for (int i = 0; i < (int)IM_ARRAYSIZE(k_res); i++)
+                    if (ImGui::Selectable(k_res[i].name, i == ri)) {
+                        s->render_scale = k_res[i].scale;
+                        changed = true;
+                    }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The game's 3D drawn at this size, then fitted to the window.\n"
+                                  "Pick the one nearest your screen's height.");
+        }
 
         bool sc = s->shader_cache != 0;
         if (ImGui::Checkbox("Shader cache", &sc)) {
