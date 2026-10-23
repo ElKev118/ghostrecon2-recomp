@@ -71,6 +71,11 @@ static struct {
     VkCommandBuffer  cmd;
     VkFence          fence;
     VkSemaphore      sem_acquire, sem_done;
+
+    /* VK_EXT_full_screen_exclusive: whether the driver may take the display
+     * for itself (see create_swapchain). */
+    int              fse;
+    int              has_surf_caps2;
 } V;
 
 /* Shared with the executor thread. */
@@ -130,6 +135,18 @@ static int create_device(void)
         fprintf(stderr, "[VKW] SDL_Vulkan_GetInstanceExtensions: %s\n", SDL_GetError());
         return 0;
     }
+    {
+        /* VK_EXT_full_screen_exclusive needs this on the instance. */
+        VkExtensionProperties ip[64];
+        uint32_t n_ip = 64, k;
+        if (vkEnumerateInstanceExtensionProperties(NULL, &n_ip, ip) >= 0)
+            for (k = 0; k < n_ip && n_ext < 16; k++)
+                if (!strcmp(ip[k].extensionName,
+                            VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+                    exts[n_ext++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+                    V.has_surf_caps2 = 1;
+                }
+    }
     app.pApplicationName = "Ghost Recon 2 (recompiled)";
     app.apiVersion = VK_API_VERSION_1_3;
     ici.pApplicationInfo = &app;
@@ -180,8 +197,9 @@ static int create_device(void)
         /* Swapchain for the window; push descriptors and (core 1.3)
          * dynamic rendering for the renderer, which binds a new set of
          * textures and a new target per batch. */
-        const char *dev_ext[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                                  VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
+        const char *dev_ext[3] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                                   VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, NULL };
+        uint32_t n_dev_ext = 2;
         VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
         VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
@@ -198,11 +216,24 @@ static int create_device(void)
         dci.pNext = &f2;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = 2;
+        if (V.has_surf_caps2) {
+            VkExtensionProperties dp[256];
+            uint32_t n_dp = 256, k;
+            if (vkEnumerateDeviceExtensionProperties(V.phys, NULL, &n_dp, dp) >= 0)
+                for (k = 0; k < n_dp; k++)
+                    if (!strcmp(dp[k].extensionName,
+                                VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)) {
+                        dev_ext[n_dev_ext++] = VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME;
+                        V.fse = 1;
+                    }
+        }
+        dci.enabledExtensionCount = n_dev_ext;
         dci.ppEnabledExtensionNames = dev_ext;
         VKCHECK(vkCreateDevice(V.phys, &dci, NULL, &V.dev), "vkCreateDevice");
         volkLoadDevice(V.dev);
         vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
+        fprintf(stderr, "[VKW] full-screen exclusive control: %s\n",
+                V.fse ? "yes (borderless stays a window)" : "not offered by the driver");
         s_ctx.inst = V.inst;
         s_ctx.phys = V.phys;
         s_ctx.dev = V.dev;
@@ -290,6 +321,19 @@ static int create_swapchain(void)
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
+    /* Without this the driver decides, and AMD's and NVIDIA's take a window
+     * that covers the screen as exclusive fullscreen: borderless then
+     * behaved like old exclusive mode -- no taskbar over it, Alt+Tab
+     * switching the display. Windowed and borderless are disallowed;
+     * exclusive fullscreen leaves it to the driver. */
+    VkSurfaceFullScreenExclusiveInfoEXT fsi = {
+        VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
+    if (V.fse) {
+        fsi.fullScreenExclusive = port_settings()->window_mode == PS_FULLSCREEN
+            ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+            : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        sci.pNext = &fsi;
+    }
     VKCHECK(vkCreateSwapchainKHR(V.dev, &sci, NULL, &V.swap), "vkCreateSwapchainKHR");
     if (old)
         vkDestroySwapchainKHR(V.dev, old, NULL);
