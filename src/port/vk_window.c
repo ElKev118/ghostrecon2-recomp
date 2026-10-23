@@ -22,6 +22,7 @@
  *   RECOMP_PRESENT_VSYNC=0     present without waiting for the display
  *   F11 / Alt+Enter            toggle borderless fullscreen
  *   Delete / Home              the port options menu (port_menu.cpp)
+ *   F8                         mark the log: "a glitch just happened"
  */
 
 #include <stdint.h>
@@ -779,6 +780,17 @@ static int window_thread(void *unused)
                     || ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
                 && port_settings()->window_mode == PS_FULLSCREEN)
                 release_swapchain();
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F8 && !ev.key.repeat) {
+                /* "I just saw a glitch": a timestamp in the log to line up
+                 * with what the renderer was doing (new pipelines, uploads,
+                 * surfaces) -- the brief glitches do not reproduce on
+                 * demand. */
+                static unsigned marks;
+                fprintf(stderr, "[MARK] #%u t=%u ms -- user saw a glitch\n",
+                        ++marks, SDL_GetTicks());
+                fflush(stderr);
+                continue;
+            }
             if (pmenu_event(&ev))
                 continue;             /* the options menu's, not the game's */
             if (ev.type == SDL_QUIT) {
