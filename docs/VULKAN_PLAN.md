@@ -258,6 +258,22 @@ index conversion 4.5 %, driver calls ~6 %). Next candidates: x87 stack and
 MMX as locals (game thread), passing 16-bit triangle-list indices straight
 to Vulkan, a second executor stage (decode vs. command recording).
 
+OPTIONAL, measured 2026-10-23 on the new rig (5800X3D + RX 7800 XT),
+mission 1 forest, no frame limit: ~108 FPS (5700G: ~102). The GPU is idle
+(1.7 ms busy a frame); the limit is the pushbuffer thread at 100 % CPU,
+executing 8.9 ms a frame: ~1800 draws, ~20 MB of vertices copied and
+~6.8 MB hashed per frame ([VKB] stats line). Levers, roughly by size:
+- stop copying vertex data the GPU already has: upload each guest vertex
+  buffer once and reuse it while its data_gen is unchanged, instead of
+  copying per draw (s_vreuse covers only part of it);
+- hash less: the 6.8 MB a frame of texture/vertex hashing to detect
+  changes -- use dirty tracking like the vertex-program constants
+  (nv2a_vsh_take_dirty), or hash on a sample;
+- the remaining small items above (16-bit indices straight to Vulkan,
+  method dispatch, texture lookup).
+Only worth it if higher resolutions or the APU need the headroom; the
+7800 XT already runs well above 100 FPS.
+
 ## 2026-10-22: two-stage executor, clocks, audio mixdown
 
 - Two-stage execution (RECOMP_PB_THREADS=2, on in run_gr2_sinlimite.bat):
