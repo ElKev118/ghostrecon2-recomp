@@ -451,6 +451,10 @@ static int present(int upload)
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT
                                     | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
+    /* Minimised (exclusive fullscreen minimises when it loses focus): there
+     * is nothing to show and a swapchain the size of nothing. */
+    if (SDL_GetWindowFlags(V.win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))
+        return 1;
     if (V.swap_dirty && !create_swapchain())
         return 0;
     if (!V.swap || !V.swap_ext.width)
@@ -465,9 +469,18 @@ static int present(int upload)
         upload = 0;                           /* the renderer owns the picture */
 
     vkWaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX);
-    r = vkAcquireNextImageKHR(V.dev, V.swap, UINT64_MAX, V.sem_acquire,
-                              VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { V.swap_dirty = 1; return 1; }
+    /* Bounded: a swapchain whose display was taken away (exclusive
+     * fullscreen, the Windows key) may never hand out an image again, and
+     * an unbounded wait here stopped the event loop with it. */
+    r = vkAcquireNextImageKHR(V.dev, V.swap, 100000000ull /* 100 ms */,
+                              V.sem_acquire, VK_NULL_HANDLE, &idx);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY)
+        return 1;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR
+        || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+        V.swap_dirty = 1;
+        return 1;
+    }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
         return vk_fail("vkAcquireNextImageKHR", r);
     vkResetFences(V.dev, 1, &V.fence);
@@ -583,7 +596,8 @@ static int present(int upload)
     pi.pImageIndices = &idx;
     r = vkQueuePresentKHR(V.queue, &pi);
     vkw_queue_unlock();
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR
+        || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
         V.swap_dirty = 1;
     else if (r != VK_SUCCESS)
         return vk_fail("vkQueuePresentKHR", r);
@@ -614,6 +628,21 @@ static void on_flip(const uint32_t *xrgb, uint32_t w, uint32_t h)
 }
 
 /* ---- window thread ---------------------------------------------------- */
+
+/* A present that failed is not a reason to stop the window: the event loop
+ * is also what answers Alt+F4, Alt+Tab and the menu. It used to break out,
+ * which froze the picture with the sound still playing and the window deaf
+ * to everything. Rebuild the swapchain and try again shortly. */
+static void present_failed(void)
+{
+    static unsigned n;
+    if (n++ < 20) {
+        fprintf(stderr, "[VKW] present failed; rebuilding the swapchain\n");
+        fflush(stderr);
+    }
+    V.swap_dirty = 1;
+    SDL_Delay(50);
+}
 
 /* PS_WINDOWED / PS_BORDERLESS / PS_FULLSCREEN. Exclusive fullscreen takes
  * the desktop's own mode, so the display does not switch resolution. */
@@ -732,7 +761,7 @@ static int window_thread(void *unused)
 
         if (upload || V.swap_dirty || s_gpu_frames != s_gpu_shown) {
             if (!present(upload))
-                break;
+                present_failed();
         } else if (pmenu_is_open()) {
             /* The menu animates and answers the mouse even when the game
              * shows no new frame (loading, paused): redraw it at ~60 Hz. */
@@ -740,7 +769,7 @@ static int window_thread(void *unused)
             if (SDL_GetTicks() - last_menu >= 16) {
                 last_menu = SDL_GetTicks();
                 if (!present(0))
-                    break;
+                    present_failed();
             } else {
                 SDL_Delay(2);
             }
