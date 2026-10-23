@@ -23,6 +23,10 @@
  *   F11 / Alt+Enter            toggle borderless fullscreen
  *   Delete / Home              the port options menu (port_menu.cpp)
  *   F8                         mark the log: "a glitch just happened"
+ *   F7                         cyan capture: frame + per-draw probe of its cyan
+ *                              (cyan<N>_frame.bmp, pr<N>_*, [CYAN]/[PROBE])
+ *   F6                         audio capture: last 8 s (audio_cap<N>.wav),
+ *                              limiter load and the voices ([AUDIO-CAP])
  */
 
 #include <stdint.h>
@@ -789,6 +793,22 @@ static int window_thread(void *unused)
                 fprintf(stderr, "[MARK] #%u t=%u ms -- user saw a glitch\n",
                         ++marks, SDL_GetTicks());
                 fflush(stderr);
+                continue;
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F7 && !ev.key.repeat) {
+                /* "Look at this cyan": the renderer reads the frame back,
+                 * finds the cyan in it and probes it on the next frame. */
+                extern void vkb_request_cyan_capture(void);
+                fprintf(stderr, "[MARK] t=%u ms -- F7 cyan capture requested\n", SDL_GetTicks());
+                vkb_request_cyan_capture();
+                continue;
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F6 && !ev.key.repeat) {
+                /* "This sound is wrong": the last seconds of audio, how hard
+                 * the limiter worked, and the voices playing. */
+                extern void xbox_AudioCapture(void);
+                fprintf(stderr, "[MARK] t=%u ms -- F6 audio capture\n", SDL_GetTicks());
+                xbox_AudioCapture();
                 continue;
             }
             if (pmenu_event(&ev))

@@ -752,6 +752,9 @@ typedef struct {
     float d0[4], tc0[4];
 } ProbeRec;
 static ProbeRec s_probe_rec[PROBE_MAX];
+/* The points probed: from RECOMP_VK_PROBE, or found by the F7 cyan capture. */
+static int px = -2, py, npts;
+static int ptx[PROBE_PTS], pty[PROBE_PTS];
 static VkBuffer s_probe_buf;
 static VkDeviceMemory s_probe_mem;
 static uint8_t *s_probe_map;
@@ -2474,8 +2477,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
          * pixel (x,y) of the colour target after every draw and log it with
          * the draw's state -- which draw turns a pixel wrong. */
         /* RECOMP_VK_PROBE=x,y[;x,y...]: up to PROBE_PTS points at once. */
-        static int px = -2, py, active, done, idx, npts;
-        static int ptx[PROBE_PTS], pty[PROBE_PTS];
+        static int active, done, idx;
         if (px == -2) {
             const char *e = getenv("RECOMP_VK_PROBE");
             px = -1;
@@ -3118,6 +3120,126 @@ static void dump_frame(VkImage img, uint32_t w, uint32_t h)
     vkFreeMemory(B.dev, mem, NULL);
 }
 
+/* ---- F7: the cyan capture ------------------------------------------------
+ *
+ * Far terrain sometimes comes out cyan, and where depends on the camera, so
+ * the probe (RECOMP_VK_PROBE=x,y) cannot be pointed at it in advance. F7
+ * reads the frame on screen back, writes it as cyan<N>_frame.bmp, finds the
+ * places with the most cyan in it (up to PROBE_PTS, one per grid cell) and
+ * probes those on the next frame: the log then says, draw by draw, which one
+ * turned each of them cyan, with its textures and combiner state, and the
+ * surfaces are written as pr<N>_*. */
+static volatile LONG s_cyan_request;
+
+void vkb_request_cyan_capture(void)
+{
+    InterlockedExchange(&s_cyan_request, 1);
+}
+
+static int is_cyan(const uint8_t *bgra)
+{
+    int bb = bgra[0], gg = bgra[1], rr = bgra[2];
+    return gg + bb > 60 && 2 * rr < gg && 2 * rr < bb;
+}
+
+static void cyan_capture(VkImage img, uint32_t w, uint32_t h)
+{
+    enum { GX = 8, GY = 6 };
+    static unsigned shot;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint8_t *map;
+    VkBufferImageCopy c;
+    unsigned cnt[GY][GX];
+    int bx[GY][GX], by[GY][GX], bd[GY][GX];
+    uint32_t x, y;
+    int i, found = 0;
+    char path[64];
+    FILE *f;
+
+    if (!make_buffer((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf, &mem,
+                     (void **)&map))
+        return;
+    begin_frame();
+    memset(&c, 0, sizeof c);
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = w;
+    c.imageExtent.height = h;
+    c.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(cur()->cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    submit_frame();
+    vkDeviceWaitIdle(B.dev);
+
+    snprintf(path, sizeof path, "cyan%u_frame.bmp", shot);
+    if ((f = fopen(path, "wb"))) {
+        uint8_t hdr[54];
+        uint32_t rowpad = (4 - (w * 3) % 4) % 4, size = 54 + (w * 3 + rowpad) * h;
+        static const uint8_t pad[3];
+        memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B'; hdr[1] = 'M';
+        memcpy(hdr + 2, &size, 4);
+        hdr[10] = 54; hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4);
+        memcpy(hdr + 22, &h, 4);
+        hdr[26] = 1; hdr[28] = 24;
+        fwrite(hdr, 1, 54, f);
+        for (y = h; y-- > 0;) {
+            for (x = 0; x < w; x++)
+                fwrite(map + ((size_t)y * w + x) * 4, 1, 3, f);
+            fwrite(pad, 1, rowpad, f);
+        }
+        fclose(f);
+    }
+
+    /* Cyan per grid cell; the cyan pixel nearest each cell's centre. */
+    memset(cnt, 0, sizeof cnt);
+    for (y = 0; y < (uint32_t)GY; y++)
+        for (x = 0; x < (uint32_t)GX; x++)
+            bd[y][x] = 1 << 30;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int cx = (int)(x * GX / w), cy = (int)(y * GY / h), d;
+            if (!is_cyan(map + ((size_t)y * w + x) * 4))
+                continue;
+            cnt[cy][cx]++;
+            d = abs((int)x - (int)((2 * cx + 1) * w / (2 * GX)))
+              + abs((int)y - (int)((2 * cy + 1) * h / (2 * GY)));
+            if (d < bd[cy][cx]) { bd[cy][cx] = d; bx[cy][cx] = (int)x; by[cy][cx] = (int)y; }
+        }
+    npts = 0;
+    for (i = 0; i < PROBE_PTS; i++) {
+        int best = -1, bxx = 0, byy = 0;
+        unsigned bc = 0;
+        for (y = 0; y < (uint32_t)GY; y++)
+            for (x = 0; x < (uint32_t)GX; x++)
+                if (cnt[y][x] > bc && cnt[y][x] >= 16) { bc = cnt[y][x]; best = 1; bxx = (int)x; byy = (int)y; }
+        if (best < 0)
+            break;
+        ptx[npts] = bx[byy][bxx];
+        pty[npts] = by[byy][bxx];
+        found += (int)bc;
+        npts++;
+        cnt[byy][bxx] = 0;
+    }
+    fprintf(stderr, "[CYAN] capture %u: frame %ux%u written to %s; %d cyan pixels in the"
+            " probed cells, %d points:", shot, w, h, path, found, npts);
+    for (i = 0; i < npts; i++)
+        fprintf(stderr, " (%d,%d)", ptx[i], pty[i]);
+    fprintf(stderr, "%s\n", npts ? " -- probing the next frame" : " -- nothing cyan on screen");
+    fflush(stderr);
+    if (npts) {
+        px = ptx[0];
+        py = pty[0];
+        s_probe_armed = 1;        /* the next present starts the probed frame */
+    }
+    shot++;
+    vkDestroyBuffer(B.dev, buf, NULL);
+    vkFreeMemory(B.dev, mem, NULL);
+    begin_frame();
+    B.rt_color = NULL;
+}
+
 static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
                         uint32_t aa_sx, uint32_t aa_sy)
 {
@@ -3173,6 +3295,8 @@ static void vkb_present(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
         B.out_i = o;
         vkw_set_gpu_frame(B.out[o], w, h);
         dump_frame(B.out[o], w, h);
+        if (s_cyan_request && InterlockedExchange(&s_cyan_request, 0))
+            cyan_capture(B.out[o], w, h);
         {
             /* Frames presented, once a second: the window title says it too,
              * but a log outlives the window. */
