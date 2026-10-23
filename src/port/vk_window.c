@@ -265,6 +265,37 @@ static int create_device(void)
 
 /* ---- swapchain -------------------------------------------------------- */
 
+/* Exclusive fullscreen going to the background (Windows key, Alt+Tab): give
+ * the display back. SDL minimises the window, but while an exclusive
+ * swapchain exists the driver keeps the monitor showing its last image --
+ * the game stayed frozen on screen with the Start menu, the taskbar and
+ * Alt+Tab unable to come in front. The next present after the window is
+ * restored builds a new one (swap_dirty). */
+static void release_swapchain(void)
+{
+    uint32_t i;
+
+    if (!V.swap)
+        return;
+    vkw_queue_lock();                 /* the renderer submits on this queue */
+    vkDeviceWaitIdle(V.dev);
+    for (i = 0; i < VKW_MAX_IMAGES; i++) {
+        if (V.swap_view[i])
+            vkDestroyImageView(V.dev, V.swap_view[i], NULL);
+        V.swap_view[i] = VK_NULL_HANDLE;
+    }
+    vkDestroySwapchainKHR(V.dev, V.swap, NULL);
+    V.swap = VK_NULL_HANDLE;
+    V.swap_count = 0;
+    vkw_queue_unlock();
+    V.swap_dirty = 1;
+    if (getenv("RECOMP_WINDOW_TRACE")) {
+        fprintf(stderr, "[VKW] t=%u swapchain released (exclusive fullscreen in background)\n",
+                SDL_GetTicks());
+        fflush(stderr);
+    }
+}
+
 static int create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -357,6 +388,12 @@ static int create_swapchain(void)
     }
     pmenu_set_image_count(V.swap_count);
     V.swap_dirty = 0;
+    if (getenv("RECOMP_WINDOW_TRACE")) {
+        fprintf(stderr, "[VKW] t=%u swapchain %ux%u, %u images, mode %d\n",
+                SDL_GetTicks(), V.swap_ext.width, V.swap_ext.height,
+                V.swap_count, port_settings()->window_mode);
+        fflush(stderr);
+    }
     return 1;
 }
 
@@ -454,6 +491,11 @@ static int present(int upload)
     /* Minimised (exclusive fullscreen minimises when it loses focus): there
      * is nothing to show and a swapchain the size of nothing. */
     if (SDL_GetWindowFlags(V.win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN))
+        return 1;
+    /* Exclusive fullscreen in the background: presenting would take the
+     * display back (see release_swapchain). */
+    if (port_settings()->window_mode == PS_FULLSCREEN
+        && !(SDL_GetWindowFlags(V.win) & SDL_WINDOW_INPUT_FOCUS))
         return 1;
     if (V.swap_dirty && !create_swapchain())
         return 0;
@@ -596,6 +638,10 @@ static int present(int upload)
     pi.pImageIndices = &idx;
     r = vkQueuePresentKHR(V.queue, &pi);
     vkw_queue_unlock();
+    if (r != VK_SUCCESS && getenv("RECOMP_WINDOW_TRACE")) {
+        fprintf(stderr, "[VKW] t=%u present -> %d\n", SDL_GetTicks(), (int)r);
+        fflush(stderr);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR
         || r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
         V.swap_dirty = 1;
@@ -722,6 +768,17 @@ static int window_thread(void *unused)
         int upload = 0;
 
         while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_WINDOWEVENT && getenv("RECOMP_WINDOW_TRACE")) {
+                fprintf(stderr, "[VKW] t=%u window event %d flags=%08X menu=%d\n",
+                        SDL_GetTicks(), ev.window.event,
+                        SDL_GetWindowFlags(V.win), pmenu_is_open());
+                fflush(stderr);
+            }
+            if (ev.type == SDL_WINDOWEVENT
+                && (ev.window.event == SDL_WINDOWEVENT_MINIMIZED
+                    || ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                && port_settings()->window_mode == PS_FULLSCREEN)
+                release_swapchain();
             if (pmenu_event(&ev))
                 continue;             /* the options menu's, not the game's */
             if (ev.type == SDL_QUIT) {
