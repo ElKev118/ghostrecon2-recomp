@@ -210,6 +210,7 @@ static void panel(void)
                 { 4.0f,  "x4 (2560x1920)" },
                 { 4.5f,  "x4.5 (2880x2160, 4K)" },
                 { 5.0f,  "x5 (3200x2400)" },
+                { 6.0f,  "x6 (3840x2880, 2x2 supersampling at 1440p)" },
             };
             int ri = 0;
             for (int i = 0; i < (int)IM_ARRAYSIZE(k_res); i++)
@@ -250,13 +251,18 @@ static void panel(void)
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("When the window is bigger than the internal resolution:\n"
                                   "FSR 1 enlarges with sharp edges; Bilinear is softer.");
-            if (s->upscaler == 1) {
-                float sh = s->sharpness * 100.0f;
-                if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 100.0f, "%.0f%%")) {
-                    s->sharpness = sh / 100.0f;
-                    changed = true;
-                }
+        }
+        {
+            float sh = s->sharpen * 100.0f;
+            if (ImGui::SliderFloat("Sharpen (RCAS)", &sh, 0.0f, 100.0f,
+                                   sh < 0.5f ? "Off" : "%.0f%%")) {
+                s->sharpen = sh / 100.0f;
+                changed = true;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("FSR's contrast-adaptive sharpening, last, at any scale.\n"
+                                  "50-70%% brings back detail after supersampling;\n"
+                                  "high values also bring back shimmer and halos.");
         }
         {
             static const char *filters[] = { "Bilinear", "Area (supersampling)" };

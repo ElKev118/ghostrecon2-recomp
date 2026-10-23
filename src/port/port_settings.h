@@ -32,7 +32,7 @@ typedef struct {
     int   aspect;          /* PS_ASPECT_*: how the 4:3 frame fills the window */
     int   aa;              /* PS_AA_*: anti-aliasing of the frame */
     int   upscaler;        /* PS_UPSCALE_*: enlarging to the window */
-    float sharpness;       /* FSR's RCAS, 0..1 (1 = sharpest) */
+    float sharpen;         /* RCAS at the end, 0 off .. 1 sharpest */
     int   scale_filter;    /* VKP_*: 1 area (shrinking averages each pixel), 0 bilinear */
 } PortSettings;
 

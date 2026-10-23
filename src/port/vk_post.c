@@ -10,10 +10,12 @@
  *   SMAA     iryoku/smaa 1x (MIT), its three passes on the frame at the
  *            internal resolution: luma edges, blending weights (area and
  *            search textures), neighbourhood blending
- *   FSR 1    AMD FidelityFX FSR 1 (MIT) when the frame is enlarged: EASU
- *            into an image the size of its place on screen, then RCAS
- *            sharpening into the swapchain. The constants are worked out in
- *            the shaders (FsrEasuCon / FsrRcasCon run on the GPU too).
+ *   FSR 1    AMD FidelityFX FSR 1 (MIT): EASU when the frame is enlarged,
+ *            into an image the size of its place on screen; RCAS sharpening
+ *            from that image into the swapchain, at any scale (after the
+ *            area downscale too) when Sharpen is on. The constants are
+ *            worked out in the shaders (FsrEasuCon / FsrRcasCon run on the
+ *            GPU too).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,7 +181,8 @@ static struct {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkShaderModule vs, fs;
-    VkPipeline pipe;
+    VkPipeline pipe;              /* for the swapchain's format, fmt */
+    VkPipeline pipe_tmp;          /* for fsr_tmp (B8G8R8A8) */
     VkFormat fmt;
     int ok;
 
@@ -595,7 +598,7 @@ VkImageView vkp_smaa(VkCommandBuffer cmd, VkImageView src, uint32_t w, uint32_t 
     return P.out.view;
 }
 
-/* ---- FSR 1 -------------------------------------------------------------- */
+/* ---- FSR 1 / RCAS ------------------------------------------------------- */
 
 static VkShaderModule fsr_module(const char *mid, const char *main_src)
 {
@@ -633,20 +636,11 @@ static int fsr_init(VkFormat dst_format)
     return 1;
 }
 
-int vkp_fsr(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h,
-            VkImageView dst, VkFormat dst_format, uint32_t dst_w, uint32_t dst_h,
-            VkRect2D rect, float sharpness)
+/* EASU / RCAS usable, RCAS built for dst_format. */
+static int fsr_ready(VkFormat dst_format)
 {
-    uint32_t ow = rect.extent.width, oh = rect.extent.height;
-    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
-    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
-    VkViewport vp;
-    FsrPush pc;
-
-    if (!P.ok || !src || !dst || !ow || !oh)
-        return 0;
     if (!P.fsr_tried && !(P.fsr_ok = fsr_init(dst_format)))
-        fprintf(stderr, "[VKP] FSR 1 unavailable\n");
+        fprintf(stderr, "[VKP] FSR 1 / RCAS unavailable\n");
     if (!P.fsr_ok)
         return 0;
     if (dst_format != P.rcas_fmt) {
@@ -657,84 +651,57 @@ int vkp_fsr(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h
         P.rcas = np;
         P.rcas_fmt = dst_format;
     }
-    if (P.fsr_w != ow || P.fsr_h != oh) {
-        /* Used by this pass only, idle after the window's fence. */
-        if (!make_img(&P.fsr_tmp, ow, oh, VK_FORMAT_B8G8R8A8_UNORM,
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
-            P.fsr_ok = 0;
-            return 0;
-        }
-        P.fsr_w = ow;
-        P.fsr_h = oh;
+    return 1;
+}
+
+/* fsr_tmp at ow x oh: the frame at its size on screen, before RCAS. Used by
+ * these passes only, idle after the window's fence. */
+static int fsr_tmp(uint32_t ow, uint32_t oh)
+{
+    if (P.fsr_w == ow && P.fsr_h == oh)
+        return 1;
+    if (!make_img(&P.fsr_tmp, ow, oh, VK_FORMAT_B8G8R8A8_UNORM,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        P.fsr_w = P.fsr_h = 0;
+        return 0;
     }
-    memset(&pc, 0, sizeof pc);
-    pc.sizes[0] = (float)src_w;
-    pc.sizes[1] = (float)src_h;
-    pc.sizes[2] = (float)ow;
-    pc.sizes[3] = (float)oh;
-    pc.off[0] = rect.offset.x;
-    pc.off[1] = rect.offset.y;
-    pc.sharp = sharpness;
-
-    /* EASU: the frame, enlarged, into fsr_tmp. */
-    begin_into(cmd, &P.fsr_tmp, ow, oh);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.easu);
-    bind_tex(cmd, P.fsr_layout, 1, &src, &P.lin);
-    vkCmdPushConstants(cmd, P.fsr_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
-    barrier(cmd, &P.fsr_tmp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-    /* RCAS: fsr_tmp, sharpened, into its place on the swapchain image. */
-    ca.imageView = dst;
-    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    ri.renderArea.extent.width = dst_w;
-    ri.renderArea.extent.height = dst_h;
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &ca;
-    vkCmdBeginRendering(cmd, &ri);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.rcas);
-    bind_tex(cmd, P.fsr_layout, 1, &P.fsr_tmp.view, &P.point);
-    vp.x = (float)rect.offset.x;
-    vp.y = (float)rect.offset.y;
-    vp.width = (float)ow;
-    vp.height = (float)oh;
-    vp.minDepth = 0.0f;
-    vp.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    vkCmdSetScissor(cmd, 0, 1, &rect);
-    vkCmdPushConstants(cmd, P.fsr_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
+    P.fsr_w = ow;
+    P.fsr_h = oh;
     return 1;
 }
 
 /* ---- scaling ------------------------------------------------------------ */
 
-int vkp_draw(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h,
-             VkImageView dst, VkFormat dst_format, uint32_t dst_w, uint32_t dst_h,
-             VkRect2D rect, int filter)
+/* The scaling pipeline for a target format: the swapchain's (rebuilt if it
+ * changes) or fsr_tmp's. */
+static VkPipeline scale_pipe(VkFormat fmt)
+{
+    if (fmt == P.fmt)
+        return P.pipe;
+    if (fmt == VK_FORMAT_B8G8R8A8_UNORM) {
+        if (!P.pipe_tmp)
+            P.pipe_tmp = make_pipeline(P.vs, P.fs, P.layout, fmt);
+        return P.pipe_tmp;
+    }
+    {
+        VkPipeline np = make_pipeline(P.vs, P.fs, P.layout, fmt);
+        if (!np)
+            return VK_NULL_HANDLE;
+        vkDestroyPipeline(P.dev, P.pipe, NULL);
+        P.pipe = np;
+        P.fmt = fmt;
+        return np;
+    }
+}
+
+/* Begin rendering into dst (contents kept), viewport and scissor = rect. */
+static void begin_rect(VkCommandBuffer cmd, VkImageView dst, uint32_t dst_w, uint32_t dst_h,
+                       VkRect2D rect)
 {
     VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     VkViewport vp;
-    Push pc;
 
-    if (!P.ok || !src || !dst || !rect.extent.width || !rect.extent.height)
-        return 0;
-    if (dst_format != P.fmt) {
-        VkPipeline np = make_pipeline(P.vs, P.fs, P.layout, dst_format);
-        if (!np) {
-            P.ok = 0;
-            return 0;
-        }
-        vkDestroyPipeline(P.dev, P.pipe, NULL);
-        P.pipe = np;
-        P.fmt = dst_format;
-    }
     ca.imageView = dst;
     ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -745,9 +712,6 @@ int vkp_draw(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(cmd, &ri);
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.pipe);
-    bind_tex(cmd, P.layout, 1, &src, &P.lin);
     vp.x = (float)rect.offset.x;
     vp.y = (float)rect.offset.y;
     vp.width = (float)rect.extent.width;
@@ -756,12 +720,86 @@ int vkp_draw(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_
     vp.maxDepth = 1.0f;
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &rect);
+}
+
+/* src scaled (area / bilinear) into rect of dst, which is in
+ * COLOR_ATTACHMENT_OPTIMAL. */
+static int scale_into(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h,
+                      VkImageView dst, VkFormat fmt, uint32_t dst_w, uint32_t dst_h,
+                      VkRect2D rect, int filter)
+{
+    VkPipeline pipe = scale_pipe(fmt);
+    Push pc;
+
+    if (!pipe)
+        return 0;
+    begin_rect(cmd, dst, dst_w, dst_h, rect);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    bind_tex(cmd, P.layout, 1, &src, &P.lin);
     pc.src_size[0] = (float)src_w;
     pc.src_size[1] = (float)src_h;
     pc.dst_size[0] = (float)rect.extent.width;
     pc.dst_size[1] = (float)rect.extent.height;
     pc.filt = filter;
     vkCmdPushConstants(cmd, P.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    return 1;
+}
+
+int vkp_present(VkCommandBuffer cmd, VkImageView src, uint32_t src_w, uint32_t src_h,
+                VkImageView dst, VkFormat dst_format, uint32_t dst_w, uint32_t dst_h,
+                VkRect2D rect, int filter, int fsr, float sharpen)
+{
+    uint32_t ow = rect.extent.width, oh = rect.extent.height;
+    int enlarge = ow > src_w || oh > src_h;
+    int use_fsr, use_rcas;
+    FsrPush pc;
+
+    if (!P.ok || !src || !dst || !ow || !oh)
+        return 0;
+    use_fsr = fsr && enlarge && fsr_ready(dst_format);
+    use_rcas = sharpen > 0.0f && fsr_ready(dst_format);
+    if ((!use_fsr && !use_rcas) || !fsr_tmp(ow, oh))
+        return scale_into(cmd, src, src_w, src_h, dst, dst_format, dst_w, dst_h, rect, filter);
+
+    memset(&pc, 0, sizeof pc);
+    pc.sizes[0] = (float)src_w;
+    pc.sizes[1] = (float)src_h;
+    pc.sizes[2] = (float)ow;
+    pc.sizes[3] = (float)oh;
+    pc.off[0] = rect.offset.x;
+    pc.off[1] = rect.offset.y;
+    /* RCAS takes stops: 0 = sharpest, 2 = a quarter of that. */
+    pc.sharp = 2.0f * (1.0f - (sharpen > 1.0f ? 1.0f : sharpen));
+
+    /* 1: the frame at its size on screen, in fsr_tmp -- EASU when it is
+     * enlarged and FSR is chosen, else the scaling pass. */
+    {
+        VkRect2D full = { { 0, 0 }, { ow, oh } };
+        begin_into(cmd, &P.fsr_tmp, ow, oh);
+        if (use_fsr) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.easu);
+            bind_tex(cmd, P.fsr_layout, 1, &src, &P.lin);
+            vkCmdPushConstants(cmd, P.fsr_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        } else {
+            vkCmdEndRendering(cmd);            /* begin_into only for the clear + layout */
+            scale_into(cmd, src, src_w, src_h, P.fsr_tmp.view, VK_FORMAT_B8G8R8A8_UNORM,
+                       ow, oh, full, filter);
+        }
+        barrier(cmd, &P.fsr_tmp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /* 2: into its place on the swapchain image -- RCAS-sharpened, or as it
+     * is (1:1) when sharpening is off. */
+    if (!use_rcas)
+        return scale_into(cmd, P.fsr_tmp.view, ow, oh, dst, dst_format, dst_w, dst_h, rect, 0);
+    begin_rect(cmd, dst, dst_w, dst_h, rect);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, P.rcas);
+    bind_tex(cmd, P.fsr_layout, 1, &P.fsr_tmp.view, &P.point);
+    vkCmdPushConstants(cmd, P.fsr_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRendering(cmd);
     return 1;
