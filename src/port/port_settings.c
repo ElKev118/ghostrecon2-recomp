@@ -76,6 +76,7 @@ void port_settings_startup(void)
     s_cur.render_scale = getenv("RECOMP_RENDER_SCALE")
                        ? (float)atof(getenv("RECOMP_RENDER_SCALE")) : 1.0f;
     s_cur.aspect = env_int("RECOMP_ASPECT", PS_ASPECT_4_3);
+    s_cur.scale_filter = env_int("RECOMP_SCALE_FILTER", 1);
 
     if (use_ini) {
         char buf[16];
@@ -90,6 +91,7 @@ void port_settings_startup(void)
         s_cur.shader_cache = ini_int("Display", "ShaderCache", s_cur.shader_cache);
         s_cur.render_scale = ini_float("Display", "RenderScale", s_cur.render_scale);
         s_cur.aspect = ini_int("Display", "Aspect", s_cur.aspect);
+        s_cur.scale_filter = ini_int("Display", "ScaleFilter", s_cur.scale_filter);
         _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
 
         /* Read once by the window and the kernel at their own start. */
@@ -138,6 +140,7 @@ int port_settings_save(void)
     snprintf(b, sizeof b, "%.3f", s_cur.frame_ms);  ok &= put("Display", "FrameLimitMs", b);
     snprintf(b, sizeof b, "%.2f", s_cur.render_scale); ok &= put("Display", "RenderScale", b);
     snprintf(b, sizeof b, "%d", s_cur.aspect);      ok &= put("Display", "Aspect", b);
+    snprintf(b, sizeof b, "%d", s_cur.scale_filter); ok &= put("Display", "ScaleFilter", b);
     snprintf(b, sizeof b, "%d", s_cur.volume);      ok &= put("Audio", "Volume", b);
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);
     snprintf(b, sizeof b, "%.3f", s_cur.ambience);  ok &= put("Audio", "Ambience", b);

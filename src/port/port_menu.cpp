@@ -235,6 +235,15 @@ static void panel(void)
                 ImGui::SetTooltip("The game draws 4:3; 16:9 stretches it sideways,\n"
                                   "as xemu's widescreen view does.");
         }
+        {
+            static const char *filters[] = { "Bilinear", "Area (supersampling)" };
+            if (ImGui::Combo("Downscale filter", &s->scale_filter, filters, IM_ARRAYSIZE(filters)))
+                changed = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("When the internal resolution is above the window's:\n"
+                                  "Area averages every pixel it shrinks (smooth edges, no\n"
+                                  "shimmer); Bilinear skips most of them.");
+        }
 
         bool sc = s->shader_cache != 0;
         if (ImGui::Checkbox("Shader cache", &sc)) {

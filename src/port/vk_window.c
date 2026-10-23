@@ -43,6 +43,7 @@
 #include "vk_ctx.h"
 #include "port_menu.h"
 #include "port_settings.h"
+#include "vk_post.h"
 
 #define VKW_MAX_IMAGES 8
 
@@ -90,6 +91,8 @@ static VkwContext s_ctx;
 static volatile int s_ready;
 /* The GPU renderer's frame, when there is one (vkw_set_gpu_frame). */
 static VkImage    s_gpu_img;
+static VkImageView s_gpu_view;
+static int        s_post_ok;        /* vk_post's scaling pass is available */
 static uint32_t   s_gpu_w, s_gpu_h;
 static unsigned   s_gpu_frames, s_gpu_shown;
 static uint32_t  *s_pending;        /* latest finished frame */
@@ -482,6 +485,7 @@ static void barrier(VkImage img, VkImageLayout from, VkImageLayout to,
 static int present(int upload)
 {
     VkImage gpu_img;
+    VkImageView gpu_view;
     uint32_t gpu_w, gpu_h;
     uint32_t idx;
     VkResult r;
@@ -508,6 +512,7 @@ static int present(int upload)
         return 1;
     SDL_LockMutex(s_lock);
     gpu_img = s_gpu_img;
+    gpu_view = s_gpu_view;
     gpu_w = s_gpu_w;
     gpu_h = s_gpu_h;
     s_gpu_shown = s_gpu_frames;
@@ -591,16 +596,48 @@ static int present(int upload)
         b.dstOffsets[1].x = b.dstOffsets[0].x + (int32_t)dw;
         b.dstOffsets[1].y = b.dstOffsets[0].y + (int32_t)dh;
         b.dstOffsets[1].z = 1;
-        if (!upload || gpu_img)
-            /* The renderer's copy into its frame image was submitted
-             * earlier on this queue: make its writes visible. */
+        if (gpu_img && gpu_view && s_post_ok) {
+            /* The scaling pass (vk_post.c): the renderer's frame, sampled.
+             * Both images go back to the layouts the rest expects. */
+            VkRect2D rect;
+            rect.offset.x = b.dstOffsets[0].x;
+            rect.offset.y = b.dstOffsets[0].y;
+            rect.extent.width = dw;
+            rect.extent.height = dh;
             barrier(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            vkp_draw(V.cmd, gpu_view, sw, sh, V.swap_view[idx], V.swap_fmt,
+                     V.swap_ext.width, V.swap_ext.height, rect,
+                     port_settings()->scale_filter);
+            barrier(V.swap_img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+            barrier(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        vkCmdBlitImage(V.cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       1, &b, VK_FILTER_LINEAR);
+                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        } else {
+            if (!upload || gpu_img)
+                /* The renderer's copy into its frame image was submitted
+                 * earlier on this queue: make its writes visible. */
+                barrier(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vkCmdBlitImage(V.cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           V.swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &b, VK_FILTER_LINEAR);
+        }
     }
 
     if (pmenu_is_open()) {
@@ -754,6 +791,7 @@ static int window_thread(void *unused)
     }
     fprintf(stderr, "[VKW] window up: %ux%u, swapchain %u images\n",
             V.swap_ext.width, V.swap_ext.height, V.swap_count);
+    s_post_ok = vkp_init(V.dev, V.swap_fmt);
     {
         PortMenuInit mi;
         memset(&mi, 0, sizeof mi);
@@ -937,10 +975,11 @@ const VkwContext *vkw_wait_ready(uint32_t timeout_ms)
 void vkw_queue_lock(void)   { SDL_LockMutex(s_qlock); }
 void vkw_queue_unlock(void) { SDL_UnlockMutex(s_qlock); }
 
-void vkw_set_gpu_frame(VkImage img, uint32_t w, uint32_t h)
+void vkw_set_gpu_frame(VkImage img, VkImageView view, uint32_t w, uint32_t h)
 {
     SDL_LockMutex(s_lock);
     s_gpu_img = img;
+    s_gpu_view = view;
     s_gpu_w = w;
     s_gpu_h = h;
     s_gpu_frames++;

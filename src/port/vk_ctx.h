@@ -32,9 +32,9 @@ void vkw_queue_lock(void);
 void vkw_queue_unlock(void);
 
 /* The renderer's finished frame: an image in TRANSFER_SRC_OPTIMAL layout
- * that stays valid until the next call. From then on the window shows it
- * instead of the CPU frame. */
-void vkw_set_gpu_frame(VkImage img, uint32_t w, uint32_t h);
+ * (sampled usage, with a view) that stays valid until the next call. From
+ * then on the window shows it instead of the CPU frame. */
+void vkw_set_gpu_frame(VkImage img, VkImageView view, uint32_t w, uint32_t h);
 
 uint32_t vkw_find_memory(uint32_t type_bits, VkMemoryPropertyFlags want);
 

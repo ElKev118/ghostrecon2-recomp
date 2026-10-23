@@ -182,6 +182,7 @@ static struct {
     /* The window's frame images (copied from the flipped surface). */
     VkImage out[2];
     VkDeviceMemory out_mem[2];
+    VkImageView out_view[2];        /* sampled by the window's scaling pass */
     uint32_t out_w[2], out_h[2];
     int out_i;
 
@@ -3468,12 +3469,14 @@ static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t 
                 submit_frame();
                 vkDeviceWaitIdle(B.dev);
                 begin_frame();
+                vkDestroyImageView(B.dev, B.out_view[o], NULL);
                 vkDestroyImage(B.dev, B.out[o], NULL);
                 vkFreeMemory(B.dev, B.out_mem[o], NULL);
             }
             if (!make_image(ow, oh, VK_FORMAT_B8G8R8A8_UNORM,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            0, &B.out[o], &B.out_mem[o], NULL))
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                            | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            0, &B.out[o], &B.out_mem[o], &B.out_view[o]))
                 return;
             B.out_w[o] = ow;
             B.out_h[o] = oh;
@@ -3497,7 +3500,7 @@ static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t 
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         submit_frame();
         B.out_i = o;
-        vkw_set_gpu_frame(B.out[o], ow, oh);
+        vkw_set_gpu_frame(B.out[o], B.out_view[o], ow, oh);
         dump_frame(B.out[o], ow, oh);
         if (s_cyan_request && InterlockedExchange(&s_cyan_request, 0))
             cyan_capture(B.out[o], ow, oh);

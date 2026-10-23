@@ -28,6 +28,7 @@ typedef struct {
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
     float render_scale;    /* internal resolution, times 640x480 (1..5) */
     int   aspect;          /* PS_ASPECT_*: how the 4:3 frame fills the window */
+    int   scale_filter;    /* VKP_*: 1 area (shrinking averages each pixel), 0 bilinear */
 } PortSettings;
 
 /* Read gr2.ini (if any) and push what must be in place before the guest
