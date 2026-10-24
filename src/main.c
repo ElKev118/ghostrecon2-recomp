@@ -489,6 +489,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    /* Working dir, log file, the launcher's defaults, the save folder
+     * (src/port/gr2_paths.c): first, before anything reads them. */
+    {
+        extern void gr2_startup(void);
+        gr2_startup();
+    }
+
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -524,9 +531,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
-                    "Place the game files in the 'game' subdirectory.",
-                    "Recomp", MB_ICONERROR);
+        MessageBoxA(NULL, "Ghost Recon 2's game files were not found.\n\n"
+                    "Copy the contents of your Ghost Recon 2 Xbox disc (default.xbe\n"
+                    "and its folders) into the 'game' folder next to ghostrecon2.exe.",
+                    "Ghost Recon 2", MB_ICONERROR);
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
@@ -596,7 +604,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(YOUR_GAME_DIR, NULL);
+        extern const char *gr2_save_dir(void);
+        xbox_path_init(YOUR_GAME_DIR, gr2_save_dir());
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */

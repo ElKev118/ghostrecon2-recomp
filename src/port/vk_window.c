@@ -22,6 +22,7 @@
  *   RECOMP_PRESENT_VSYNC=0     present without waiting for the display
  *   F11 / Alt+Enter            toggle borderless fullscreen
  *   Delete / Home              the port options menu (port_menu.cpp)
+ *   F8/F7/F6 (gr2.ini [Debug] DebugKeys=1 or RECOMP_DEBUG_KEYS=1 only):
  *   F8                         mark the log: "a glitch just happened"
  *   F7                         cyan capture: frame + per-draw probe of its cyan
  *                              (cyan<N>_frame.bmp, pr<N>_*, [CYAN]/[PROBE])
@@ -835,6 +836,14 @@ static int window_thread(void *unused)
                     || ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
                 && port_settings()->window_mode == PS_FULLSCREEN)
                 release_swapchain();
+            /* F6/F7/F8 are debugging aids, off unless gr2.ini [Debug]
+             * DebugKeys=1 (or RECOMP_DEBUG_KEYS=1): F7 stalls the GPU to read
+             * the frame back, and pressed during a mission load the title
+             * could hang on a black screen. */
+            if (ev.type == SDL_KEYDOWN && !port_settings()->debug_keys
+                && (ev.key.keysym.sym == SDLK_F6 || ev.key.keysym.sym == SDLK_F7
+                    || ev.key.keysym.sym == SDLK_F8))
+                continue;
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F8 && !ev.key.repeat) {
                 /* "I just saw a glitch": a timestamp in the log to line up
                  * with what the renderer was doing (new pipelines, uploads,

@@ -207,7 +207,8 @@ set(PORT_MENU_SOURCES
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
-target_sources(${PROJECT_NAME} PRIVATE ${PORT_MENU_SOURCES} src/port/port_settings.c)
+target_sources(${PROJECT_NAME} PRIVATE ${PORT_MENU_SOURCES} src/port/port_settings.c
+    src/port/gr2_paths.c)
 # SMAA (iryoku/smaa, MIT): the window's anti-aliasing pass (vk_post.c). The
 # shader source goes in as a byte array, compiled at runtime like the rest;
 # its area and search textures are C headers already.

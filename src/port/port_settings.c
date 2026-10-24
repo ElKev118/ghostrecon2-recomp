@@ -24,16 +24,23 @@ static PortSettings s_cur;
 static int s_boot_language = 1;
 static char s_path[MAX_PATH];
 
+/* gr2.ini lives in the title's data folder (gr2_paths.c). One left beside
+ * the exe by earlier builds moves there once. */
 static void ini_path(void)
 {
-    char *slash;
+    extern const char *gr2_data_dir(void);
+    char old[MAX_PATH], *slash;
 
-    GetModuleFileNameA(NULL, s_path, MAX_PATH);
-    slash = strrchr(s_path, '\\');
-    if (slash)
-        strcpy(slash + 1, "gr2.ini");
-    else
-        strcpy(s_path, "gr2.ini");
+    snprintf(s_path, sizeof s_path, "%s\\gr2.ini", gr2_data_dir());
+    if (GetFileAttributesA(s_path) != INVALID_FILE_ATTRIBUTES)
+        return;
+    GetModuleFileNameA(NULL, old, MAX_PATH);
+    slash = strrchr(old, '\\');
+    if (!slash)
+        return;
+    strcpy(slash + 1, "gr2.ini");
+    if (GetFileAttributesA(old) != INVALID_FILE_ATTRIBUTES && MoveFileExA(old, s_path, 0))
+        fprintf(stderr, "[PORT] gr2.ini moved from %s to %s\n", old, s_path);
 }
 
 static int ini_int(const char *sec, const char *key, int def)
@@ -79,6 +86,7 @@ void port_settings_startup(void)
     s_cur.scale_filter = env_int("RECOMP_SCALE_FILTER", 1);
     s_cur.aa = env_int("RECOMP_AA", PS_AA_OFF);
     s_cur.upscaler = env_int("RECOMP_UPSCALER", PS_UPSCALE_FSR1);
+    s_cur.debug_keys = env_int("RECOMP_DEBUG_KEYS", 0);
     s_cur.sharpen = getenv("RECOMP_SHARPEN") ? (float)atof(getenv("RECOMP_SHARPEN")) : 0.0f;
 
     if (use_ini) {
@@ -98,6 +106,7 @@ void port_settings_startup(void)
         s_cur.aa = ini_int("Display", "AntiAliasing", s_cur.aa);
         s_cur.upscaler = ini_int("Display", "Upscaler", s_cur.upscaler);
         s_cur.sharpen = ini_float("Display", "Sharpen", s_cur.sharpen);
+        s_cur.debug_keys = ini_int("Debug", "DebugKeys", s_cur.debug_keys);
         _putenv(s_cur.shader_cache ? "RECOMP_SHADER_CACHE=1" : "RECOMP_SHADER_CACHE=0");
 
         /* Read once by the window and the kernel at their own start. */

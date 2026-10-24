@@ -33,6 +33,7 @@ typedef struct {
     int   aa;              /* PS_AA_*: anti-aliasing of the frame */
     int   upscaler;        /* PS_UPSCALE_*: enlarging to the window */
     float sharpen;         /* RCAS at the end, 0 off .. 1 sharpest */
+    int   debug_keys;      /* F6/F7/F8 captures; gr2.ini [Debug] only, not saved */
     int   scale_filter;    /* VKP_*: 1 area (shrinking averages each pixel), 0 bilinear */
 } PortSettings;
 
