@@ -63,8 +63,6 @@ game itself in `game\`.
 `run_gr2_debug.bat` starts the build with the debugging keys on (F8 log mark,
 F7 frame capture, F6 audio capture) and the log in `build\Release\run_debug.log`.
 
-Documentation of the port's internals: `PLAN.md`, `docs/STATUS.md`,
-`docs/VULKAN_PLAN.md`, `docs/PORT_MENU_PLAN.md`.
 
 ## Legal
 

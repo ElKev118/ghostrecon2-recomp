@@ -3,3 +3,4 @@ src/recomp/gen/
 *.log
 __pycache__/
 dist/
+docs/
