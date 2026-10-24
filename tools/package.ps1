@@ -1,15 +1,22 @@
 # Ghost Recon 2 port - make the release folder.
-#   powershell -File tools\package.ps1 [-Version 1.0] [-WithGame]
+#   powershell -File tools\package.ps1 [-Version 1.0] [-WithGame | -Zip]
 # Builds dist\GhostRecon2-v<Version>\ from build\Release: the exe, LEEME /
 # README, licences, and an empty game\ folder. -WithGame also copies
 # build\Release\game (your own game files) in, for a ready-to-play copy --
-# never publish that one.
-param([string]$Version = "1.0", [switch]$WithGame)
+# never publish that one. -Zip makes dist\GhostRecon2-v<Version>.zip
+# instead (no game files: what a GitHub release carries).
+param([string]$Version = "1.0", [switch]$WithGame, [switch]$Zip)
 $ErrorActionPreference = "Stop"
+if ($WithGame -and $Zip) { throw "-WithGame and -Zip do not go together: a zip is for publishing" }
 $root = Split-Path -Parent $PSScriptRoot
 $rel  = Join-Path $root "build\Release"
 $deps = Join-Path $root "build\_deps"
 $out  = Join-Path $root "dist\GhostRecon2-v$Version"
+if ($Zip) {
+    $zipPath = Join-Path $root "dist\GhostRecon2-v$Version.zip"
+    if (Test-Path $zipPath) { throw "$zipPath already exists: remove it first" }
+    $out = Join-Path $root "dist\_stage\GhostRecon2-v$Version"
+}
 
 if (-not (Test-Path (Join-Path $rel "ghostrecon2.exe"))) { throw "build\Release\ghostrecon2.exe not found: build first" }
 if (Test-Path $out) { throw "$out already exists: remove it first" }
@@ -63,5 +70,10 @@ if ($WithGame) {
     robocopy (Join-Path $rel "game") (Join-Path $out "game") /E /NFL /NDL /NJH /NJS /XF *.log /XD CACHE | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
     Remove-Item (Join-Path $out "game\PON_AQUI_EL_JUEGO - PUT_GAME_HERE.txt")
+}
+if ($Zip) {
+    Compress-Archive -Path $out -DestinationPath $zipPath
+    Remove-Item -Recurse -Force (Join-Path $root "dist\_stage")
+    $out = $zipPath
 }
 Write-Host "done: $out"
