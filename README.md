@@ -2,7 +2,7 @@
 
 A native Windows build of *Tom Clancy's Ghost Recon 2* (original Xbox, 2004).
 The game's own code is statically recompiled from its `default.xbe` into C by
-the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit; the Xbox
+the [xboxrecomp](https://github.com/ElKev118/xboxrecomp/tree/gr2-port) toolkit (a fork of [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)); the Xbox
 hardware and system software are replaced by native code (kernel, NV2A GPU →
 Vulkan, MCPX APU → XAudio2, USB pads → SDL2, keyboard and mouse).
 
@@ -49,6 +49,7 @@ game itself in `game\`.
    ├── ghostrecon2\     (this repository)
    └── xboxrecomp\      (branch gr2-port)
    ```
+   `git clone -b gr2-port https://github.com/ElKev118/xboxrecomp.git`
 2. Put your game's `default.xbe` in `xboxrecomp\game_files\default.xbe` and the
    whole disc in `ghostrecon2\build\Release\game\` (for running).
 3. Requirements: Visual Studio 2022 (C/C++), CMake ≥ 3.20, Python 3.10+, Git

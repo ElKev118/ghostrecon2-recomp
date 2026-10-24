@@ -13,7 +13,7 @@ Fetched at configure time by CMake (FetchContent) and linked into
 | [SMAA](https://github.com/iryoku/smaa) | 71c806a | MIT | anti-aliasing |
 | [FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | v1.0.2 | MIT | upscaling, sharpening |
 
-The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit (kernel,
+The [xboxrecomp](https://github.com/ElKev118/xboxrecomp/tree/gr2-port) toolkit, a fork of [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) (kernel,
 NV2A executor, APU, recompiler) is MIT, except the parts derived from
 [xemu](https://github.com/xemu-project/xemu): the MCPX APU (`src/apu/`) and
 the NV2A register definitions are LGPL-2.1-or-later (see the toolkit's
