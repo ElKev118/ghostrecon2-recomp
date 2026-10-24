@@ -4,3 +4,5 @@ src/recomp/gen/
 __pycache__/
 dist/
 docs/
+PLAN.md
+RECOMP_CONTEXT.md
