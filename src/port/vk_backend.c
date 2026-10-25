@@ -3458,8 +3458,16 @@ static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t 
     if (B.failed || !init())
         return;
     s = find_surface_w(va, 0, w);
-    if (!s)
+    if (!s) {
         s = find_surface(va, 0);
+        {
+            static unsigned said;
+            if (said++ < 20)
+                fprintf(stderr, "[VKB] present %08X %ux%u (pitch %u): no surface that wide, "
+                        "showing %s %ux%u\n", va, w, h, pitch, s ? "one" : "none",
+                        s ? s->w : 0, s ? s->h : 0);
+        }
+    }
     begin_frame();
     if (s && w && h) {
         o = B.out_i ^ 1;
