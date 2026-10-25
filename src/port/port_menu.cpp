@@ -20,6 +20,7 @@ extern "C" {
 #include "port_menu.h"
 #include "port_settings.h"
 #include "vk_glsl.h"
+#include "port_version.h"
 extern void vkb_pipeline_cache_forget(void);
 extern void xbox_InputSetBlocked(int blocked);
 extern void xbox_InputKeysClear(void);
@@ -174,7 +175,7 @@ static void panel(void)
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(460 * scale, 0), ImGuiCond_Always);
-    ImGui::Begin("Ghost Recon 2 - Port Options", nullptr,
+    ImGui::Begin("Ghost Recon 2 " PORT_VERSION " - Port Options", nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize
                  | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 

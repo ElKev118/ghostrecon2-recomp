@@ -45,6 +45,7 @@
 #include "port_menu.h"
 #include "port_settings.h"
 #include "vk_post.h"
+#include "port_version.h"
 
 #define VKW_MAX_IMAGES 8
 
@@ -942,9 +943,9 @@ static int window_thread(void *unused)
         if (SDL_GetTicks() - last_title >= 1000) {
             char title[96];
             unsigned f = s_flips;
-            snprintf(title, sizeof(title), "Ghost Recon 2 | %u FPS | %ux%u | %s",
-                     f - flips_at_title, V.swap_ext.width, V.swap_ext.height,
-                     s_gpu_img ? "Vulkan" : "CPU");
+            snprintf(title, sizeof(title), "Ghost Recon 2 %s | %u FPS | %ux%u | %s",
+                     PORT_VERSION, f - flips_at_title, V.swap_ext.width,
+                     V.swap_ext.height, s_gpu_img ? "Vulkan" : "CPU");
             SDL_SetWindowTitle(V.win, title);
             flips_at_title = f;
             last_title = SDL_GetTicks();
