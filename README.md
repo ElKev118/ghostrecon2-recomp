@@ -10,7 +10,7 @@ Vulkan, MCPX APU → XAudio2, USB pads → SDL2, keyboard and mouse).
 disc). This repository holds only the port's own source code; the
 recompiled game code is generated on your machine from your `default.xbe`.
 
-Current release: **v1.1** (see the [releases](https://github.com/ElKev118/ghostrecon2-recomp/releases)).
+Current release: **v1.2** (see the [releases](https://github.com/ElKev118/ghostrecon2-recomp/releases)).
 
 ## Playing (release build)
 

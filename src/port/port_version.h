@@ -8,7 +8,7 @@
 #ifndef GR2_PORT_VERSION_H
 #define GR2_PORT_VERSION_H
 
-#define PORT_VERSION        "1.1"
+#define PORT_VERSION        "1.2"
 #define PORT_TOOLKIT_VERSION "gr2-v1.0"
 
 #endif
