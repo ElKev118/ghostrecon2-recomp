@@ -58,6 +58,14 @@ typedef struct {
      * the flag. */
     int cpu_newer;
     uint32_t written;       /* B.write_seq when last drawn/cleared/blitted into */
+    /* The guest memory under the surface, hashed when it is sampled as a
+     * texture: a render target's memory does not change on its own, so a
+     * change with no draw into the surface in between is the CPU's -- a movie
+     * frame the decoder wrote where a mission's surface used to be. */
+    uint64_t memh;
+    uint32_t memh_seq;      /* `written` when memh was taken */
+    uint32_t memh_frame;    /* B.frame_no it was last checked on */
+    int      memh_valid;
 } Surface;
 
 typedef struct {
@@ -883,6 +891,40 @@ static VkImageView texture_view(const Nv2aTexStage *st)
         if (said++ < 20)
             fprintf(stderr, "[VKB] tex %08X %ux%u: no surface that wide, using %ux%u (written %u, seq %u)\n",
                     src->offset, src->width, src->height, s->w, s->h, s->written, B.write_seq);
+    }
+    if (s && s->w < src->width) {
+        /* A surface narrower than the texture cannot be it: a 256-wide
+         * colour table at the address a 640-wide movie frame now lives at
+         * showed the table, smeared over the screen. */
+        s = NULL;
+    }
+    if (s && (src->color == 0x24 || src->color == 0x25 || src->color == 0x0B
+              || src->color == 0x0C || src->color == 0x0E || src->color == 0x0F)) {
+        /* YUV, paletted and block-compressed textures cannot be rendered
+         * into, so memory that holds one is not a surface of ours. */
+        static unsigned said;
+        if (said++ < 20)
+            fprintf(stderr, "[VKB] tex %08X %ux%u fmt %02X is not a render-target format: "
+                    "reading guest memory, not the surface %08X (%ux%u)\n",
+                    src->offset, src->width, src->height, src->color, s->va, s->w, s->h);
+        s = NULL;
+    }
+    if (s && !s->cpu_newer && s->memh_frame != B.frame_no) {
+        uint32_t nbytes = tex_bytes(src);
+        uint64_t mh = hash_bytes(mem + s->va, nbytes);
+        s->memh_frame = B.frame_no;
+        if (s->memh_valid && s->memh_seq == s->written && s->memh != mh) {
+            static unsigned said;
+            s->cpu_newer = 1;
+            if (said++ < 20)
+                fprintf(stderr, "[VKB] surface %08X %ux%u: guest memory changed with no draw into it "
+                        "(seq %u): sampling memory, not the image\n",
+                        s->va, s->w, s->h, s->written);
+        } else if (!s->memh_valid || s->memh_seq != s->written) {
+            s->memh = mh;
+            s->memh_seq = s->written;
+            s->memh_valid = 1;
+        }
     }
     if (s && s->cpu_newer)
         s = NULL;                              /* read guest memory instead */
