@@ -8,7 +8,8 @@
 #ifndef GR2_PORT_VERSION_H
 #define GR2_PORT_VERSION_H
 
-#define PORT_VERSION        "1.2"
+#define PORT_VERSION        "1.3"
+#define PORT_VERSION_NUM    1,3,0,0    /* the same, for the exe's version resource */
 #define PORT_TOOLKIT_VERSION "gr2-v1.0"
 
 #endif

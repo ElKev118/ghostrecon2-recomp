@@ -1,6 +1,6 @@
 # Ghost Recon 2 — native PC port (static recompilation)
 
-A native Windows build of *Tom Clancy's Ghost Recon 2* (original Xbox, 2004).
+A native Windows build of _Tom Clancy's Ghost Recon 2_ (original Xbox, 2004).
 The game's own code is statically recompiled from its `default.xbe` into C by
 the [xboxrecomp](https://github.com/ElKev118/xboxrecomp/tree/gr2-port) toolkit (a fork of [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp)); the Xbox
 hardware and system software are replaced by native code (kernel, NV2A GPU →
@@ -10,12 +10,14 @@ Vulkan, MCPX APU → XAudio2, USB pads → SDL2, keyboard and mouse).
 disc). This repository holds only the port's own source code; the
 recompiled game code is generated on your machine from your `default.xbe`.
 
-Current release: **v1.2** (see the [releases](https://github.com/ElKev118/ghostrecon2-recomp/releases)).
+Current release: **v1.3** (see the [releases](https://github.com/ElKev118/ghostrecon2-recomp/releases)).
+The port of the game's official expansion, _Summit Strike_, is
+[summitstrike-recomp](https://github.com/ElKev118/summitstrike-recomp).
 
 ## Playing (release build)
 
-Requirements: Windows 10/11 x64, a GPU with Vulkan 1.3, and the
-[Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+Requirements: Windows 10/11 x64 and a GPU with Vulkan 1.3 (since v1.3 the
+Visual C++ Redistributable is no longer needed).
 
 ```
 GhostRecon2\
@@ -30,13 +32,24 @@ The folder can live anywhere and be moved as a whole.
 
 - **Delete** or **Home**: the port's options menu — window mode, VSync,
   frame limit, internal resolution (1x–6x), aspect ratio (4:3 / 16:9
-  stretched / fill), anti-aliasing (SMAA), upscaling (FSR 1), sharpening
-  (RCAS), downscale filter, shader cache, volume, reverb, rain/ambience
-  level, language (restart).
-- **F11** or **Alt+Enter**: fullscreen toggle.
-- XInput controllers (Xbox 360 / One / Series pads) play as the Xbox pad;
-  keyboard and mouse are mapped too (Enter/Esc = START, Space = A, E = B,
-  arrows = D-pad, Tab = BACK).
+  stretched / fill window / **native widescreen**), HUD position,
+  anti-aliasing (SMAA), upscaling (FSR 1), sharpening (RCAS), downscale
+  filter, shader cache, volume, reverb, rain/ambience level, language
+  (restart), and the keyboard and mouse controls.
+- **F11** or **Alt+Enter**: fullscreen toggle. **F9**: release / recapture
+  the mouse.
+- XInput controllers (Xbox 360 / One / Series pads) play as the Xbox pad.
+- **Keyboard and mouse**: the mouse turns the view directly, like a PC
+  shooter (slower when zoomed through a scope); every action can be
+  rebound in the options menu (two keys each, mouse buttons and wheel
+  included). Defaults: WASD move, mouse look, left click fire, right click
+  zoom, F action, R / Enter reload, Q / E lean, Left Shift / Left Ctrl
+  stance up / down, M map, Esc START, Tab BACK.
+- **Native widescreen**: the camera sees more of the world at the sides to
+  fill any screen shape (16:9, 21:9, 32:9 ...) instead of stretching the
+  4:3 picture; the HUD keeps its proportions and its corner pieces move
+  out to the screen's edges (HUD position slider). Menus and movies stay
+  4:3.
 
 Everything the port writes is in `%LOCALAPPDATA%\GhostRecon2\`:
 `SaveData\` (the console's hard disk: saves), `gr2.ini` (options),
@@ -64,7 +77,6 @@ game itself in `game\`.
 
 `run_gr2_debug.bat` starts the build with the debugging keys on (F8 log mark,
 F7 frame capture, F6 audio capture) and the log in `build\Release\run_debug.log`.
-
 
 ## Legal
 

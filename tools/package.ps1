@@ -41,10 +41,10 @@ ES
 1. Copia el contenido completo de tu disco de Ghost Recon 2 (Xbox) --
    default.xbe y todas sus carpetas -- dentro de la carpeta game\.
 2. Ejecuta ghostrecon2.exe. Esta carpeta se puede mover a donde quieras.
-Requisitos: Windows 10/11 x64, GPU con Vulkan 1.3 y Microsoft Visual C++
-2015-2022 Redistributable (x64): https://aka.ms/vs/17/release/vc_redist.x64.exe
-Supr o Inicio: menu de opciones (ventana, resolucion interna, 16:9, SMAA,
-FSR 1, nitidez, sonido, idioma...). F11 o Alt+Enter: pantalla completa.
+Requisitos: Windows 10/11 x64 y GPU con Vulkan 1.3.
+Supr o Inicio: menu de opciones (ventana, resolucion interna, pantalla ancha
+nativa, SMAA, FSR 1, nitidez, sonido, idioma, controles de teclado y raton...).
+F11 o Alt+Enter: pantalla completa. F9: soltar / recapturar el raton.
 Partidas guardadas, opciones (gr2.ini), cache de shaders y logs:
 %LOCALAPPDATA%\GhostRecon2
 
@@ -52,9 +52,9 @@ EN
 1. Copy the whole contents of your Ghost Recon 2 Xbox disc -- default.xbe
    and all its folders -- into the game\ folder.
 2. Run ghostrecon2.exe. This folder can be moved anywhere.
-Requirements: Windows 10/11 x64, a Vulkan 1.3 GPU and the Microsoft Visual
-C++ 2015-2022 Redistributable (x64).
-Delete or Home: options menu. F11 or Alt+Enter: fullscreen.
+Requirements: Windows 10/11 x64 and a Vulkan 1.3 GPU.
+Delete or Home: options menu (native widescreen, keyboard and mouse
+controls...). F11 or Alt+Enter: fullscreen. F9: release / recapture the mouse.
 Saves, options (gr2.ini), shader cache and logs: %LOCALAPPDATA%\GhostRecon2
 
 No game data is included. Ghost Recon 2 is (c) Ubisoft / Red Storm
