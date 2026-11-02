@@ -33,6 +33,7 @@
 #include "vk_glsl.h"
 #include "nv2a_backend.h"
 #include "nv2a_vsh_glsl.h"
+#include "nv2a_vsh_interp.h"
 
 #define VKB_FRAMES        2
 #define VKB_VBUF_BYTES    (48u << 20)          /* vertex ring per frame */
@@ -47,6 +48,7 @@ typedef struct {
     uint32_t w, h;              /* in the title's pixels */
     uint32_t iw, ih;            /* the image's: w, h at the internal resolution */
     float    sc;                /* that resolution: s_scale, or 1 for a lookup table */
+    float    scx;               /* horizontally: sc times the widescreen factor */
     VkImage  img;
     VkDeviceMemory mem;
     VkImageView view;
@@ -125,7 +127,29 @@ typedef struct {
     float aa[2];
     const Nv2aBatchVsh *b;      /* raw streams when b->raw */
     uint64_t layout;            /* hash of the raw vertex layout */
+    float hud[2];               /* widescreen 2D: x' = x * hud[0] + hud[1]; 0 = none */
+    int   hud_defer;            /* placed at the frame's end, with the 2D draws near it */
+    int   hud_model;            /* ... and it is a 3D model (a weapon in its box) */
+    float hud_box[4];           /* its screen rectangle: x0, x1, y0, y1 */
 } VshDraw;
+
+/* Native widescreen (vkb_set_widescreen, the 2D layer below vkb_draw_xf). */
+static float s_wide_k = 1.0f;       /* display aspect / (4/3); 1 = off */
+static float s_hud_pos = 1.0f;
+static int s_frame_3d;              /* the display surface got 3D this frame */
+static volatile LONG s_shown_2d;    /* the last presented frame had none */
+static uint32_t s_display_va[2];    /* the last two surfaces presented (double buffering) */
+/* The 2D draws of the frame so far: their boxes, and where their placement
+ * sits in the uniform buffer the GPU has not read yet (hud_finalize). */
+#define HUD_PENDING_MAX 512
+static struct { float x0, x1, y0, y1, w, h; float *slot; uint64_t prog; uint32_t src; int model; } s_hud_pend[HUD_PENDING_MAX];
+static uint32_t s_hud_src;              /* which of the title's draws a piece came from */
+/* The displayed surface's size. A draw can bind it clipped to a small window
+ * -- the weapon models in their boxes -- while its positions stay in the
+ * whole screen's pixels. */
+static float s_disp_w = 640.0f, s_disp_h = 480.0f;
+static int s_hud_npend;
+static void hud_finalize(void);
 static const VshDraw *s_vsh;
 
 typedef struct {
@@ -209,6 +233,7 @@ static PFN_vkCmdPushDescriptorSetKHR pfnPushDescriptor;
  * (vkb_set_render_scale, the options menu) takes effect at the next
  * present, by recreating the surfaces. */
 static float s_scale = 1.0f;
+static float s_wide_applied = 1.0f;   /* the widescreen factor the images have */
 static volatile LONG s_scale_req;      /* requested scale x 100, 0: none */
 
 void vkb_set_render_scale(float scale)
@@ -224,8 +249,11 @@ float vkb_get_render_scale(void)
     return r ? (float)r / 100.0f : s_scale;
 }
 
-/* A title pixel count in the image of surface s. */
-static uint32_t SCs(const void *s, uint32_t v);
+/* A title pixel count in the image of surface s: across (SCx) and down
+ * (SCy). Native widescreen makes the images wider than tall by the same
+ * factor the window stretches the frame, so nothing is stretched. */
+static uint32_t SCx(const void *s, uint32_t v);
+static uint32_t SCy(const void *s, uint32_t v);
 
 /* Lookup tables stay at the title's resolution. Ghost Recon 2 draws its
  * 256x256 colour-grade table with a quad whose edges sit on the first
@@ -250,7 +278,13 @@ static int is_lut(uint32_t va, uint32_t w)
     return 0;
 }
 
-static uint32_t SCs(const void *sv, uint32_t v)
+static uint32_t SCx(const void *sv, uint32_t v)
+{
+    const Surface *s = (const Surface *)sv;
+    return (uint32_t)((float)v * s->scx + 0.5f);
+}
+
+static uint32_t SCy(const void *sv, uint32_t v)
 {
     const Surface *s = (const Surface *)sv;
     return (uint32_t)((float)v * s->sc + 0.5f);
@@ -443,6 +477,7 @@ static void submit_frame(void)
 
     if (!f->recording)
         return;
+    hud_finalize();                     /* the 2D draws' placement, before the GPU reads it */
     end_rendering();
     if (s_qpool) {
         vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_qpool,
@@ -540,7 +575,8 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
     }
     s = &B.surf[slot];
     s->sc = !depth && is_lut(va_key(va), w) ? 1.0f : s_scale;
-    if (!make_image(SCs(s, w), SCs(s, h), depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
+    s->scx = s->sc == 1.0f && !depth && is_lut(va_key(va), w) ? 1.0f : s->sc * s_wide_applied;
+    if (!make_image(SCx(s, w), SCy(s, h), depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_B8G8R8A8_UNORM,
                     depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                           : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
@@ -555,8 +591,8 @@ static Surface *get_surface(uint32_t va, int depth, uint32_t w, uint32_t h)
     s->depth = depth;
     s->w = w;
     s->h = h;
-    s->iw = SCs(s, w);
-    s->ih = SCs(s, h);
+    s->iw = SCx(s, w);
+    s->ih = SCy(s, h);
     s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     s->last_used = B.frame_no;
     {
@@ -1909,6 +1945,7 @@ static int init(void)
     tried = 1;
     if (s_scale_req) {                 /* the setting at start: no surfaces yet */
         s_scale = (float)InterlockedExchange(&s_scale_req, 0) / 100.0f;
+        s_wide_applied = s_wide_k;
         fprintf(stderr, "[VKB] internal resolution x%.2f (640x480 -> %ux%u)\n", s_scale,
                 (unsigned)(640 * s_scale + 0.5f), (unsigned)(480 * s_scale + 0.5f));
     }
@@ -2419,7 +2456,7 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         /* c[0..191] then the anti-aliasing scale (std140: vec4s), then the
          * immediate attributes of a raw batch. */
         static uint8_t blk[192 * 16 + 16 + 256];
-        float aa[4] = { s_vsh->aa[0], s_vsh->aa[1], 0.0f, 0.0f };
+        float aa[4] = { s_vsh->aa[0], s_vsh->aa[1], s_vsh->hud[0], s_vsh->hud[1] };
         memcpy(blk, s_vsh->constants, 192 * 16);
         memcpy(blk + 192 * 16, aa, sizeof aa);
         if (rawb)
@@ -2428,15 +2465,34 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
             memset(blk + 192 * 16 + 16, 0, 256);
         vbi.buffer = f->ubuf;
         vbi.range = sizeof blk;
-        if (s_ucache.have_vsh && !memcmp(s_ucache.vsh, blk, sizeof blk)) {
+        if (!s_vsh->hud_defer && s_ucache.have_vsh && !memcmp(s_ucache.vsh, blk, sizeof blk)) {
             vbi.offset = s_ucache.vsh_off;
         } else {
             memcpy(f->umap + f->uused, blk, sizeof blk);
             vbi.offset = f->uused;
             f->uused += VSH_UBO_BYTES;
-            memcpy(s_ucache.vsh, blk, sizeof blk);
-            s_ucache.vsh_off = vbi.offset;
-            s_ucache.have_vsh = 1;
+            if (s_vsh->hud_defer) {
+                /* Its own slot: the placement is written into it later. */
+                if (s_hud_npend < HUD_PENDING_MAX) {
+                    s_hud_pend[s_hud_npend].x0 = s_vsh->hud_box[0];
+                    s_hud_pend[s_hud_npend].x1 = s_vsh->hud_box[1];
+                    s_hud_pend[s_hud_npend].y0 = s_vsh->hud_box[2];
+                    s_hud_pend[s_hud_npend].y1 = s_vsh->hud_box[3];
+                    s_hud_pend[s_hud_npend].w = s_disp_w;
+                    s_hud_pend[s_hud_npend].h = s_disp_h;
+                    s_hud_pend[s_hud_npend].slot =
+                        (float *)(f->umap + vbi.offset + 192 * 16 + 8);
+                    s_hud_pend[s_hud_npend].prog = s_vsh->b ? s_vsh->b->program_hash : 0;
+                    s_hud_pend[s_hud_npend].src = s_hud_src;
+                    s_hud_pend[s_hud_npend].model = s_vsh->hud_model;
+                    s_hud_npend++;
+                }
+                s_ucache.have_vsh = 0;
+            } else {
+                memcpy(s_ucache.vsh, blk, sizeof blk);
+                s_ucache.vsh_off = vbi.offset;
+                s_ucache.have_vsh = 1;
+            }
         }
     }
 
@@ -2526,11 +2582,25 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         uint32_t x1 = sf->clip_x + sf->width, y1 = sf->clip_y + sf->height;
         if (x1 > B.rt_color->w) x1 = B.rt_color->w;
         if (y1 > B.rt_color->h) y1 = B.rt_color->h;
+        if (s_vsh && s_vsh->hud_defer && (float)sf->width < s_disp_w) {
+            /* A 2D piece clipped to its box (the weapon models): it moves
+             * with its group at the frame's end, after this scissor is set.
+             * Groups in the middle narrow around the screen's centre, so the
+             * box also covers where it goes from there. */
+            float c = s_disp_w * 0.5f, k = s_wide_k;
+            float n0 = c + ((float)x0 - c) / k, n1 = c + ((float)x1 - c) / k;
+            if (n0 < (float)x0) x0 = (uint32_t)(n0 > 0.0f ? n0 : 0.0f);
+            if (n1 > (float)x1) x1 = (uint32_t)(n1 + 1.0f);
+            /* and the small step a model takes towards the middle */
+            x0 = x0 > 24 ? x0 - 24 : 0;
+            x1 += 24;
+            if (x1 > B.rt_color->w) x1 = B.rt_color->w;
+        }
         const Surface *t = B.rt_color;
-        sc.offset.x = (int32_t)SCs(t, x0);
-        sc.offset.y = (int32_t)SCs(t, y0);
-        sc.extent.width = x1 > x0 ? SCs(t, x1) - SCs(t, x0) : 0;
-        sc.extent.height = y1 > y0 ? SCs(t, y1) - SCs(t, y0) : 0;
+        sc.offset.x = (int32_t)SCx(t, x0);
+        sc.offset.y = (int32_t)SCy(t, y0);
+        sc.extent.width = x1 > x0 ? SCx(t, x1) - SCx(t, x0) : 0;
+        sc.extent.height = y1 > y0 ? SCy(t, y1) - SCy(t, y0) : 0;
     }
     {
         /* RECOMP_VK_TINY=1: a 1x1 scissor -- the frame without its pixel
@@ -2785,10 +2855,95 @@ static void draw_vertices(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     }
 }
 
+/* RECOMP_VK_DRAWLOG_AT=<seconds>: every draw of the first whole frame after
+ * that time, one line each -- where it lands, what it samples and, for the
+ * pre-transformed path, its screen rectangle and w (the HUD inventory for
+ * the widescreen work). 1 armed, 2 logging this frame, 3 done. */
+static int s_dlog = -1;
+static DWORD s_dlog_t0, s_dlog_at;
+static unsigned s_dlog_n;
+
+static void drawlog_frame_edge(void)
+{
+    if (s_dlog == 1 && GetTickCount() - s_dlog_t0 >= s_dlog_at) {
+        s_dlog = 2;
+        s_dlog_n = 0;
+        fprintf(stderr, "[DRAW] ---- frame begins ----\n");
+    } else if (s_dlog == 2) {
+        s_dlog = 3;
+        fprintf(stderr, "[DRAW] ---- frame ends: %u draws ----\n", s_dlog_n);
+        fflush(stderr);
+    }
+}
+
+static void vsh_input(const Nv2aBatchVsh *b, uint32_t j, float in[NV2A_VSH_INPUTS][4]);
+
+static void drawlog_draw(const Nv2aSurface *sf, const Nv2aBatchXf *b)
+{
+    const Nv2aRenderState *rs = b->state;
+    const Nv2aTexStage *t0 = &b->pixel->stage[0];
+    char geo[160];
+
+    if (s_dlog < 0) {
+        const char *e = getenv("RECOMP_VK_DRAWLOG_AT");
+        s_dlog = e ? 1 : 0;
+        s_dlog_at = e ? (DWORD)(atof(e) * 1000.0) : 0;
+        s_dlog_t0 = GetTickCount();
+    }
+    if (s_dlog != 2)
+        return;
+    if (s_vsh) {
+        /* Where it lands: the program run on the CPU over its vertices. */
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, w0 = 1e9f, w1 = -1e9f;
+        uint32_t j, n = s_vsh->nverts < 2048 ? s_vsh->nverts : 2048;
+        for (j = 0; j < n; j++) {
+            float in[NV2A_VSH_INPUTS][4];
+            Nv2aVshOutput o;
+            vsh_input(s_vsh->b, j, in);
+            if (!nv2a_vsh_run_with(s_vsh->b->program, s_vsh->b->start, s_vsh->b->constants,
+                                   (const float (*)[4])in, &o))
+                break;
+            if (o.pos[0] < x0) x0 = o.pos[0];
+            if (o.pos[0] > x1) x1 = o.pos[0];
+            if (o.pos[1] < y0) y0 = o.pos[1];
+            if (o.pos[1] > y1) y1 = o.pos[1];
+            if (o.pos[3] < w0) w0 = o.pos[3];
+            if (o.pos[3] > w1) w1 = o.pos[3];
+        }
+        snprintf(geo, sizeof geo, "vsh %016llX %u idx %u verts %s  x %.1f..%.1f  y %.1f..%.1f  w %.3f..%.3f",
+                 (unsigned long long)s_vsh->b->program_hash,
+                 s_vsh->nindices, s_vsh->nverts, s_vsh->b->raw ? "raw" : "floats", x0, x1, y0, y1, w0, w1);
+    } else if (b->vertices && b->count) {
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, w0 = 1e9f, w1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+        uint32_t i;
+        for (i = 0; i < b->count; i++) {
+            const float *q = b->vertices[i].pos;
+            if (q[0] < x0) x0 = q[0];
+            if (q[0] > x1) x1 = q[0];
+            if (q[1] < y0) y0 = q[1];
+            if (q[1] > y1) y1 = q[1];
+            if (q[2] < z0) z0 = q[2];
+            if (q[2] > z1) z1 = q[2];
+            if (q[3] < w0) w0 = q[3];
+            if (q[3] > w1) w1 = q[3];
+        }
+        snprintf(geo, sizeof geo, "xf %u v  x %.1f..%.1f  y %.1f..%.1f  w %.4f..%.4f  z %.0f..%.0f",
+                 b->count, x0, x1, y0, y1, w0, w1, z0, z1);
+    } else {
+        snprintf(geo, sizeof geo, "xf (no vertices)");
+    }
+    fprintf(stderr, "[DRAW] #%u surf %08X %ux%u  %s  tex0 %08X %ux%u f%02X  blend %u ztest %u\n",
+            s_dlog_n++, sf->color_va, sf->width, sf->height, geo,
+            t0->enabled ? t0->t.offset : 0, t0->enabled ? t0->t.width : 0,
+            t0->enabled ? t0->t.height : 0, t0->enabled ? t0->t.color : 0,
+            rs->blend_enable, rs->depth_test_enable);
+}
+
 static void vkb_draw_xf(const Nv2aSurface *sf, const Nv2aBatchXf *b)
 {
     if (B.failed)
         return;
+    drawlog_draw(sf, b);
     {
         /* RECOMP_VK_SKIP_TEX=<va>: drop every draw that samples that
          * address on any stage (diagnostic: what a pass contributes). */
@@ -3015,10 +3170,10 @@ static void vkb_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         if (y1 > B.rt_color->h) y1 = B.rt_color->h;
         if (x0 >= x1 || y0 >= y1)
             return;
-        rect.rect.offset.x = (int32_t)SCs(B.rt_color, x0);
-        rect.rect.offset.y = (int32_t)SCs(B.rt_color, y0);
-        rect.rect.extent.width = SCs(B.rt_color, x1) - SCs(B.rt_color, x0);
-        rect.rect.extent.height = SCs(B.rt_color, y1) - SCs(B.rt_color, y0);
+        rect.rect.offset.x = (int32_t)SCx(B.rt_color, x0);
+        rect.rect.offset.y = (int32_t)SCy(B.rt_color, y0);
+        rect.rect.extent.width = SCx(B.rt_color, x1) - SCx(B.rt_color, x0);
+        rect.rect.extent.height = SCy(B.rt_color, y1) - SCy(B.rt_color, y0);
     }
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;
@@ -3060,17 +3215,17 @@ static int vkb_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
         return 1;
     if (w > s->w - sx) w = s->w - sx;
     if (h > s->h - sy) h = s->h - sy;
-    if (s->sc != d->sc) {
+    if (s->sc != d->sc || s->scx != d->scx) {
         /* One side is a 1x lookup table: scale the copy. */
         VkImageBlit bl;
         memset(&bl, 0, sizeof bl);
         bl.srcSubresource = rgn.srcSubresource;
         bl.dstSubresource = rgn.dstSubresource;
-        bl.srcOffsets[0].x = (int32_t)SCs(s, sx); bl.srcOffsets[0].y = (int32_t)SCs(s, sy);
-        bl.srcOffsets[1].x = (int32_t)SCs(s, sx + w); bl.srcOffsets[1].y = (int32_t)SCs(s, sy + h);
+        bl.srcOffsets[0].x = (int32_t)SCx(s, sx); bl.srcOffsets[0].y = (int32_t)SCy(s, sy);
+        bl.srcOffsets[1].x = (int32_t)SCx(s, sx + w); bl.srcOffsets[1].y = (int32_t)SCy(s, sy + h);
         bl.srcOffsets[1].z = 1;
-        bl.dstOffsets[0].x = (int32_t)SCs(d, dx); bl.dstOffsets[0].y = (int32_t)SCs(d, dy);
-        bl.dstOffsets[1].x = (int32_t)SCs(d, dx + w); bl.dstOffsets[1].y = (int32_t)SCs(d, dy + h);
+        bl.dstOffsets[0].x = (int32_t)SCx(d, dx); bl.dstOffsets[0].y = (int32_t)SCy(d, dy);
+        bl.dstOffsets[1].x = (int32_t)SCx(d, dx + w); bl.dstOffsets[1].y = (int32_t)SCy(d, dy + h);
         bl.dstOffsets[1].z = 1;
         if ((uint32_t)bl.dstOffsets[1].x > d->iw) bl.dstOffsets[1].x = (int32_t)d->iw;
         if ((uint32_t)bl.dstOffsets[1].y > d->ih) bl.dstOffsets[1].y = (int32_t)d->ih;
@@ -3078,10 +3233,10 @@ static int vkb_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
                        d->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
         return 1;
     }
-    rgn.srcOffset.x = (int32_t)SCs(s, sx); rgn.srcOffset.y = (int32_t)SCs(s, sy);
-    rgn.dstOffset.x = (int32_t)SCs(d, dx); rgn.dstOffset.y = (int32_t)SCs(d, dy);
-    rgn.extent.width = SCs(s, sx + w) - SCs(s, sx);
-    rgn.extent.height = SCs(s, sy + h) - SCs(s, sy);
+    rgn.srcOffset.x = (int32_t)SCx(s, sx); rgn.srcOffset.y = (int32_t)SCy(s, sy);
+    rgn.dstOffset.x = (int32_t)SCx(d, dx); rgn.dstOffset.y = (int32_t)SCy(d, dy);
+    rgn.extent.width = SCx(s, sx + w) - SCx(s, sx);
+    rgn.extent.height = SCy(s, sy + h) - SCy(s, sy);
     if (rgn.dstOffset.x + rgn.extent.width > d->iw) rgn.extent.width = d->iw - rgn.dstOffset.x;
     if (rgn.dstOffset.y + rgn.extent.height > d->ih) rgn.extent.height = d->ih - rgn.dstOffset.y;
     rgn.extent.depth = 1;
@@ -3433,7 +3588,7 @@ static void apply_render_scale(void)
     if (!r)
         return;
     InterlockedExchange(&s_scale_req, 0);
-    if (want == s_scale)
+    if (want == s_scale && s_wide_applied == s_wide_k)
         return;
     end_rendering();
     submit_frame();
@@ -3451,6 +3606,7 @@ static void apply_render_scale(void)
     fprintf(stderr, "[VKB] internal resolution x%.2f -> x%.2f (640x480 -> %ux%u)\n",
             s_scale, want, (unsigned)(640 * want + 0.5f), (unsigned)(480 * want + 0.5f));
     s_scale = want;
+    s_wide_applied = s_wide_k;
 }
 
 static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
@@ -3489,6 +3645,13 @@ static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t 
                               uint32_t aa_sx, uint32_t aa_sy)
 {
     s_presents++;
+    drawlog_frame_edge();
+    InterlockedExchange(&s_shown_2d, !s_frame_3d);
+    s_frame_3d = 0;
+    if ((va & 0x0FFFFFFFu) != (s_display_va[0] & 0x0FFFFFFFu)) {
+        s_display_va[1] = s_display_va[0];
+        s_display_va[0] = va;
+    }
     if (s_probe_armed == 1 || s_probe_armed == 3)
         s_probe_armed++;                       /* 3 -> 4: the frame is done */
     Surface *s;
@@ -3513,7 +3676,7 @@ static void vkb_present_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t 
     begin_frame();
     if (s && w && h) {
         o = B.out_i ^ 1;
-        uint32_t ow = SCs(s, w), oh = SCs(s, h);
+        uint32_t ow = SCx(s, w), oh = SCy(s, h);
         if (!B.out[o] || B.out_w[o] != ow || B.out_h[o] != oh) {
             if (B.out[o]) {
                 submit_frame();
@@ -3660,6 +3823,7 @@ static const char *VSH_EPILOGUE =
     "  vec4 p = oPos;\n"
     "  if (floatBitsToUint(p.w) == 0u) p.w = 1.0;\n"   /* +0: no divide by w */
     "  p.xy *= vaa.xy;\n"
+    "  if (vaa.z != 0.0) p.x = p.x * vaa.z + vaa.w * vaa.x;\n"   /* widescreen 2D */
     "  float w = p.w;\n"
     "  vec2 sp = trunc(p.xy * 16.0) / 16.0;\n"
     "  vec3 ndc = vec3(sp.x / pc.surf.x * 2.0 - 1.0,\n"
@@ -3754,10 +3918,381 @@ static VshProg *vsh_get(const Nv2aBatchVsh *b, uint32_t *id)
             FILE *fp = fopen("vsh_failed.glsl", "wb");
             if (fp) { fputs(src, fp); fclose(fp); }
         }
+        {
+            /* RECOMP_VK_VSH_SAVE=<hash>[,<hash>...]: that program's GLSL, to
+             * vsh_<hash>.glsl, to read what it does. */
+            const char *e = getenv("RECOMP_VK_VSH_SAVE");
+            char hx[24];
+            snprintf(hx, sizeof hx, "%016llX", (unsigned long long)p->hash);
+            if (e && strstr(e, hx)) {
+                char name[48];
+                FILE *fp;
+                snprintf(name, sizeof name, "vsh_%s.glsl", hx);
+                fp = fopen(name, "wb");
+                if (fp) { fputs(src, fp); fclose(fp); }
+            }
+        }
     }
     free(src);
     free(body);
     return p->mod ? p : NULL;
+}
+
+/* ---- native widescreen: the 2D layer ------------------------------------
+ *
+ * With a widened camera (the title's own aspect, set by the port) the frame
+ * is a squeezed wide view the window stretches back, so everything 2D the
+ * title draws over it -- radar, ammunition, crosshair, markers, menus --
+ * comes out stretched with it. Each 2D draw on the display surface is
+ * narrowed back by 1/k (k = wide aspect / 4:3) in the vertex stage, and the
+ * draw's screen rectangle (the batch's program run on the CPU) decides where
+ * it goes:
+ *   - full width (fades, night vision, post-process quads): untouched;
+ *   - inside a corner (radar, ammunition, team status): to its side's edge,
+ *     s_hud_pos of the way from the 4:3 middle (0) to the screen's edge (1);
+ *   - anything else (crosshair, markers over the world, text, menu panels):
+ *     narrowed around its own centre, so it stays where the title put it.
+ * A frame with no 3D in it (menus, movies, loading) is shown 4:3 instead.
+ */
+
+
+void vkb_set_widescreen(float k, float hud_pos)
+{
+    float nk = k > 1.01f ? k : 1.0f;
+    s_hud_pos = hud_pos < 0.0f ? 0.0f : hud_pos > 1.0f ? 1.0f : hud_pos;
+    if (nk == s_wide_k)
+        return;
+    s_wide_k = nk;
+    if (!B.dev)                        /* before the first surface: just use it */
+        s_wide_applied = nk;
+    else                               /* rebuild the images at the next present */
+        InterlockedExchange(&s_scale_req, (LONG)(vkb_get_render_scale() * 100.0f + 0.5f));
+}
+
+/* For the window: the frame just presented has no 3D (show it 4:3). */
+int vkb_presented_is_2d(void)
+{
+    return s_wide_k > 1.01f && s_shown_2d;
+}
+
+/* One input of vertex j, as the program sees it. */
+static void vsh_input(const Nv2aBatchVsh *b, uint32_t j, float in[NV2A_VSH_INPUTS][4])
+{
+    uint32_t k, r, c;
+    for (r = 0; r < NV2A_VSH_INPUTS; r++) {
+        in[r][0] = in[r][1] = in[r][2] = 0.0f;
+        in[r][3] = 1.0f;
+    }
+    if (!b->raw) {
+        for (k = 0; k < b->ninputs; k++)
+            memcpy(in[b->input_reg[k] & 15], b->inputs + ((size_t)j * b->ninputs + k) * 4,
+                   4 * sizeof(float));
+        return;
+    }
+    for (r = 0; r < NV2A_VSH_INPUTS; r++)
+        if (b->imm_mask & (1u << r))
+            memcpy(in[r], b->imm[r], sizeof in[r]);
+    for (k = 0; k < b->nattrs; k++) {
+        uint32_t st = b->attr[k].stream, sz = b->attr[k].size;
+        const uint8_t *e;
+        float *d = in[b->attr[k].reg & 15];
+        if (st >= b->nstreams || sz < 1 || sz > 4)
+            continue;
+        if ((size_t)j * b->stream[st].stride + b->attr[k].offset + sz * 4 > b->stream[st].bytes)
+            continue;
+        e = b->stream[st].data + (size_t)j * b->stream[st].stride + b->attr[k].offset;
+        for (c = 0; c < sz; c++) {
+            switch (b->attr[k].type) {
+            case 2: memcpy(&d[c], e + c * 4, 4); break;
+            case 1: { int16_t v; memcpy(&v, e + c * 2, 2); d[c] = v / 32767.0f; } break;
+            case 5: { int16_t v; memcpy(&v, e + c * 2, 2); d[c] = (float)v; } break;
+            case 4: d[c] = e[c] / 255.0f; break;
+            case 0: d[c] = e[(c < 3 ? 2 - c : 3)] / 255.0f; break;   /* B,G,R,A */
+            default: break;
+            }
+        }
+    }
+}
+
+/* The pieces of a 2D draw: runs of its triangles, in order, that touch one
+ * another. One batch can hold things far apart -- the world markers of the
+ * whole team, say -- and each needs its own placement. */
+#define HUD_RUNS_MAX 32
+#define HUD_MODEL_INWARD 0.03f   /* share of the way to the group's middle */
+typedef struct { uint32_t first, count; float box[4]; } HudRun;
+
+/* The pieces of a 2D draw with their screen rectangles (box: x0, x1, y0, y1);
+ * how many, or 0 for a draw left alone (full width, or not flat). Triangles
+ * with no area -- unused slots of a batch, folded onto one point -- are drawn
+ * but take no part in the rectangles. */
+static int hud_place(const Nv2aSurface *sf, const Nv2aBatchVsh *b, HudRun *runs, int model)
+{
+    static float px[4096], py[4096];
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    float W = s_disp_w, H = s_disp_h;
+    uint32_t j, t;
+    int nr = 0;
+
+    static int trace = -1;
+    static unsigned said;
+    {
+        /* RECOMP_VK_HUD_TRACE=<seconds>: trace from that time on. */
+        static DWORD t0;
+        if (trace < 0) {
+            const char *e = getenv("RECOMP_VK_HUD_TRACE");
+            trace = e ? 0 : -2;
+            t0 = GetTickCount() + (e ? (DWORD)(atof(e) * 1000.0) : 0);
+        }
+        if (trace == 0 && (LONG)(GetTickCount() - t0) >= 0)
+            trace = 1;
+    }
+#define HUD_SAY(...) do { if (trace == 1 && said < 400) { said++; fprintf(stderr, __VA_ARGS__); } } while (0)
+    if (b->nverts > 4096 || !b->nverts) {
+        HUD_SAY("[HUD] %016llX: %u verts, skipped\n", (unsigned long long)b->program_hash, b->nverts);
+        return 0;
+    }
+    for (j = 0; j < b->nverts; j++) {
+        float in[NV2A_VSH_INPUTS][4];
+        Nv2aVshOutput o;
+        vsh_input(b, j, in);
+        if (!nv2a_vsh_run_with(b->program, b->start, b->constants,
+                               (const float (*)[4])in, &o)) {
+            HUD_SAY("[HUD] %016llX: the interpreter could not run it\n", (unsigned long long)b->program_hash);
+            return 0;
+        }
+        if (!model && o.pos[3] != 0.0f && o.pos[3] != 1.0f) {
+            /* A real perspective w: not a flat 2D draw after all. */
+            if (o.pos[3] < 0.999f || o.pos[3] > 1.001f) {
+                HUD_SAY("[HUD] %016llX: w %.4f, not flat\n", (unsigned long long)b->program_hash, o.pos[3]);
+                return 0;
+            }
+        }
+        px[j] = o.pos[0];
+        py[j] = o.pos[1];
+    }
+    for (t = 0; t + 2 < b->nindices; t += 3) {
+        uint32_t a = b->indices[t], c = b->indices[t + 1], e = b->indices[t + 2];
+        float tx0, tx1, ty0, ty1, area;
+        if (a >= b->nverts || c >= b->nverts || e >= b->nverts)
+            return 0;
+        area = (px[c] - px[a]) * (py[e] - py[a]) - (px[e] - px[a]) * (py[c] - py[a]);
+        if (area < 0.01f && area > -0.01f) {
+            if (nr) runs[nr - 1].count = t + 3 - runs[nr - 1].first;
+            continue;                                   /* no area */
+        }
+        tx0 = px[a] < px[c] ? px[a] : px[c]; if (px[e] < tx0) tx0 = px[e];
+        tx1 = px[a] > px[c] ? px[a] : px[c]; if (px[e] > tx1) tx1 = px[e];
+        ty0 = py[a] < py[c] ? py[a] : py[c]; if (py[e] < ty0) ty0 = py[e];
+        ty1 = py[a] > py[c] ? py[a] : py[c]; if (py[e] > ty1) ty1 = py[e];
+        if (tx0 < x0) x0 = tx0;
+        if (tx1 > x1) x1 = tx1;
+        if (ty0 < y0) y0 = ty0;
+        if (ty1 > y1) y1 = ty1;
+        if (nr) {
+            /* Part of the piece before it: touching it, or close by. */
+            float m = 16.0f, *r = runs[nr - 1].box;
+            if (tx0 - m <= r[1] && r[0] - m <= tx1 && ty0 - m <= r[3] && r[2] - m <= ty1) {
+                if (tx0 < r[0]) r[0] = tx0;
+                if (tx1 > r[1]) r[1] = tx1;
+                if (ty0 < r[2]) r[2] = ty0;
+                if (ty1 > r[3]) r[3] = ty1;
+                runs[nr - 1].count = t + 3 - runs[nr - 1].first;
+                continue;
+            }
+        }
+        if (nr == HUD_RUNS_MAX)
+            return 0;
+        runs[nr].first = nr ? runs[nr - 1].first + runs[nr - 1].count : 0;
+        runs[nr].count = t + 3 - runs[nr].first;
+        runs[nr].box[0] = tx0; runs[nr].box[1] = tx1;
+        runs[nr].box[2] = ty0; runs[nr].box[3] = ty1;
+        nr++;
+    }
+    HUD_SAY("[HUD] %016llX: x %.1f..%.1f y %.1f..%.1f, %d piece(s) (surface %.0fx%.0f)\n",
+            (unsigned long long)b->program_hash, x0, x1, y0, y1, nr, W, H);
+    if (!nr || x1 - x0 >= W * 0.98f)
+        return 0;                                       /* full width */
+    runs[nr - 1].count = b->nindices - runs[nr - 1].first;   /* any trailing flat ones */
+    return nr;
+}
+
+/* The frame's 2D draws, placed by groups: the pieces of one thing -- a menu,
+ * a line of text and its button icons, the command cross, the radar and its
+ * dots -- touch or sit on one row close together, and must move as one. A
+ * group in a corner goes to its side's edge (s_hud_pos of the way from the
+ * 4:3 middle); any other is narrowed around its own centre, so a marker over
+ * the world, alone in its group, stays on what it marks. */
+static void hud_finalize(void)
+{
+    static int par[HUD_PENDING_MAX];
+    int n = s_hud_npend, i, j;
+    float k = s_wide_k, inv;
+
+    s_hud_npend = 0;
+    if (!n || k <= 1.01f)
+        return;
+    static int group_trace = -1;
+    if (group_trace < 0) group_trace = getenv("RECOMP_VK_GROUP_TRACE") != NULL;
+    if (group_trace) {
+        static unsigned frames;
+        if (frames++ < 100000)
+            fprintf(stderr, "[GROUP] ---- %d 2D draws ----\n", n);
+    }
+    inv = 1.0f / k;
+    for (i = 0; i < n; i++)
+        par[i] = i;
+    for (i = 0; i < n; i++)
+        for (j = i + 1; j < n; j++) {
+            float m = 6.0f;
+            float hi = s_hud_pend[i].y1 - s_hud_pend[i].y0, hj = s_hud_pend[j].y1 - s_hud_pend[j].y0;
+            float vov = (s_hud_pend[i].y1 < s_hud_pend[j].y1 ? s_hud_pend[i].y1 : s_hud_pend[j].y1)
+                      - (s_hud_pend[i].y0 > s_hud_pend[j].y0 ? s_hud_pend[i].y0 : s_hud_pend[j].y0);
+            float gap = s_hud_pend[i].x0 > s_hud_pend[j].x1 ? s_hud_pend[i].x0 - s_hud_pend[j].x1
+                      : s_hud_pend[j].x0 > s_hud_pend[i].x1 ? s_hud_pend[j].x0 - s_hud_pend[i].x1 : 0.0f;
+            int touch = s_hud_pend[i].x0 - m <= s_hud_pend[j].x1 && s_hud_pend[j].x0 - m <= s_hud_pend[i].x1
+                     && s_hud_pend[i].y0 - m <= s_hud_pend[j].y1 && s_hud_pend[j].y0 - m <= s_hud_pend[i].y1;
+            /* One row of text and icons: about the same height, mostly the
+             * same band, a word space apart. A marker over the world beside
+             * a taller thing on its row is not part of it. */
+            float hmin = hi < hj ? hi : hj, hmax = hi < hj ? hj : hi;
+            int row = hmax <= 2.0f * hmin && vov >= 0.6f * hmin && gap <= 48.0f;
+            if (touch || row) {
+                int a = i, b = j;
+                while (par[a] != a) a = par[a] = par[par[a]];
+                while (par[b] != b) b = par[b] = par[par[b]];
+                if (a != b) par[b] = a;
+            }
+        }
+    for (i = 0; i < n; i++) {
+        int r = i;
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, W, H, cx, cy, off;
+        int corner_y;
+        float big_area = 0.0f, bx[4] = { 0 };
+        while (par[r] != r) r = par[r];
+        if (r != i)
+            continue;                   /* each group once, from its root */
+        for (j = 0; j < n; j++) {
+            int q = j;
+            while (par[q] != q) q = par[q];
+            if (q != r) continue;
+            if (s_hud_pend[j].x0 < x0) x0 = s_hud_pend[j].x0;
+            if (s_hud_pend[j].x1 > x1) x1 = s_hud_pend[j].x1;
+            if (s_hud_pend[j].y0 < y0) y0 = s_hud_pend[j].y0;
+            if (s_hud_pend[j].y1 > y1) y1 = s_hud_pend[j].y1;
+        }
+        /* A group with one draw that frames it -- the cross, the radar, a
+         * menu's panel -- is placed by that draw (its pieces in the group):
+         * a world marker passing over it joins the group but must not move
+         * it. */
+        for (j = 0; j < n; j++) {
+            int q = j, l;
+            float u[4], a;
+            while (par[q] != q) q = par[q];
+            if (q != r) continue;
+            for (l = 0; l < j; l++) {    /* each draw once, from its first piece */
+                int ql = l;
+                while (par[ql] != ql) ql = par[ql];
+                if (ql == r && s_hud_pend[l].src == s_hud_pend[j].src) break;
+            }
+            if (l < j) continue;
+            u[0] = s_hud_pend[j].x0; u[1] = s_hud_pend[j].x1;
+            u[2] = s_hud_pend[j].y0; u[3] = s_hud_pend[j].y1;
+            for (l = j + 1; l < n; l++) {
+                int ql = l;
+                while (par[ql] != ql) ql = par[ql];
+                if (ql != r || s_hud_pend[l].src != s_hud_pend[j].src) continue;
+                if (s_hud_pend[l].x0 < u[0]) u[0] = s_hud_pend[l].x0;
+                if (s_hud_pend[l].x1 > u[1]) u[1] = s_hud_pend[l].x1;
+                if (s_hud_pend[l].y0 < u[2]) u[2] = s_hud_pend[l].y0;
+                if (s_hud_pend[l].y1 > u[3]) u[3] = s_hud_pend[l].y1;
+            }
+            a = (u[1] - u[0]) * (u[3] - u[2]);
+            if (a > big_area) { big_area = a; memcpy(bx, u, sizeof bx); }
+        }
+        if (big_area >= 0.5f * (x1 - x0) * (y1 - y0)) {
+            x0 = bx[0]; x1 = bx[1]; y0 = bx[2]; y1 = bx[3];
+        }
+        W = s_hud_pend[r].w; H = s_hud_pend[r].h;
+        cx = (x0 + x1) * 0.5f; cy = (y0 + y1) * 0.5f;
+        /* RECOMP_VK_DRAWLOG_CROSS=1 / _PANEL=1: the draw log (as with
+         * RECOMP_VK_DRAWLOG_AT) of the next frame after one with the command
+         * cross / a full-width menu panel on screen. */
+        static int dl_cross = -1, dl_panel;
+        if (dl_cross < 0) {
+            dl_cross = getenv("RECOMP_VK_DRAWLOG_CROSS") != NULL;
+            dl_panel = getenv("RECOMP_VK_DRAWLOG_PANEL") != NULL;
+        }
+        if (s_dlog <= 0 && x0 <= W * 0.32f && x1 >= W * 0.68f && y1 - y0 >= H * 0.45f
+            && (dl_panel ? x1 - x0 >= W * 0.8f : dl_cross && x1 - x0 <= W * 0.5f)) {
+            s_dlog = 1;
+            s_dlog_t0 = GetTickCount();
+            s_dlog_at = 0;
+        }
+        corner_y = cy <= H / 3.0f || cy >= H * 2.0f / 3.0f;
+        {
+            float centre = W * 0.5f * (1.0f - inv);         /* the 4:3 middle */
+            if (corner_y && cx <= W * 0.30f)
+                off = centre + s_hud_pos * (0.0f - centre);
+            else if (corner_y && cx >= W * 0.70f && x1 <= W)
+                off = centre + s_hud_pos * (W * (1.0f - inv) - centre);
+            else
+                off = cx * (1.0f - inv);                    /* around its own centre */
+        }
+        {
+            /* RECOMP_VK_GROUP_TRACE=<seconds>: the groups each frame makes, from
+             * that time on (a few hundred lines). */
+            static int gt = -1;
+            static DWORD gt0;
+            static unsigned said;
+            if (gt < 0) {
+                const char *e = getenv("RECOMP_VK_GROUP_TRACE");
+                gt = e ? 0 : 2;
+                gt0 = GetTickCount() + (e ? (DWORD)(atof(e) * 1000.0) : 0);
+            }
+            if (gt == 0 && (LONG)(GetTickCount() - gt0) >= 0)
+                gt = 1;
+            if (gt == 1 && said++ < 400000) {
+                int members = 0;
+                for (j = 0; j < n; j++) {
+                    int q = j;
+                    while (par[q] != q) q = par[q];
+                    if (q == r) members++;
+                }
+                fprintf(stderr, "[GROUP] %d draws  x %.0f..%.0f  y %.0f..%.0f  -> %s off %.1f\n",
+                        members, x0, x1, y0, y1,
+                        (corner_y && cx <= W * 0.30f) ? "left edge"
+                        : (corner_y && cx >= W * 0.70f && x1 <= W) ? "right edge" : "own centre", off);
+                for (j = 0; j < n; j++) {
+                    int q = j;
+                    while (par[q] != q) q = par[q];
+                    if (q == r)
+                        fprintf(stderr, "[GROUP]    #%d %016llX x %.1f..%.1f y %.1f..%.1f\n", j,
+                                (unsigned long long)s_hud_pend[j].prog, s_hud_pend[j].x0,
+                                s_hud_pend[j].x1, s_hud_pend[j].y0, s_hud_pend[j].y1);
+                }
+            }
+        }
+        for (j = 0; j < n; j++) {
+            int q = j;
+            while (par[q] != q) q = par[q];
+            if (q != r) continue;
+            s_hud_pend[j].slot[0] = inv;
+            s_hud_pend[j].slot[1] = off;
+            if (s_hud_pend[j].model) {
+                /* A model in its box (the weapons) sits right against the
+                 * box's outer side once narrowed: a little towards the
+                 * group's middle, the whole model by the same amount. */
+                float m0 = s_hud_pend[j].x0, m1 = s_hud_pend[j].x1;
+                int l;
+                for (l = 0; l < n; l++)
+                    if (s_hud_pend[l].src == s_hud_pend[j].src) {
+                        if (s_hud_pend[l].x0 < m0) m0 = s_hud_pend[l].x0;
+                        if (s_hud_pend[l].x1 > m1) m1 = s_hud_pend[l].x1;
+                    }
+                s_hud_pend[j].slot[1] = off + (cx - (m0 + m1) * 0.5f) * inv * HUD_MODEL_INWARD;
+            }
+        }
+    }
 }
 
 static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
@@ -3793,6 +4328,36 @@ static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
     d.aa[0] = b->aa_sx;
     d.aa[1] = b->aa_sy;
     d.b = b;
+    static int hud_trace = -1;
+    if (hud_trace < 0) hud_trace = getenv("RECOMP_VK_HUD_TRACE") != NULL;
+    if (s_wide_k > 1.01f && b->state && hud_trace) {
+        static unsigned n;
+        if (n++ < 40)
+            fprintf(stderr, "[HUD] draw on %08X (display %08X/%08X) ztest %u frame3d %d\n",
+                    sf->color_va, s_display_va[0], s_display_va[1], b->state->depth_test_enable, s_frame_3d);
+    }
+    HudRun runs[HUD_RUNS_MAX];
+    int nruns = 0;
+    if (s_wide_k > 1.01f && b->state
+        && ((sf->color_va & 0x0FFFFFFFu) == (s_display_va[0] & 0x0FFFFFFFu)
+            || (sf->color_va & 0x0FFFFFFFu) == (s_display_va[1] & 0x0FFFFFFFu))) {
+        if (sf->width >= 320 && sf->height >= 240) {
+            s_disp_w = (float)sf->width;
+            s_disp_h = (float)sf->height;
+        }
+        if (b->state->depth_test_enable) {
+            /* A model drawn over the frame's 2D layer -- the weapons in the
+             * command cross and on the equipment screen -- belongs to it: the
+             * title draws it with a 4:3 projection of its own, so it is
+             * narrowed and placed with the 2D pieces around it. */
+            if (s_frame_3d && s_hud_npend)
+                nruns = hud_place(sf, b, runs, 1);
+            d.hud_model = nruns > 0;
+            s_frame_3d = 1;
+        }
+        else if (s_frame_3d)
+            nruns = hud_place(sf, b, runs, s_hud_npend > 0);   /* a model over the 2D, too */
+    }
     if (b->raw) {
         uint64_t h = 1469598103934665603ull;
         uint32_t k;
@@ -3809,6 +4374,22 @@ static int vkb_draw_vsh(const Nv2aSurface *sf, const Nv2aBatchVsh *b)
     x.count = b->nindices;
     x.state = b->state;
     x.pixel = b->pixel;
+    if (nruns) {
+        /* Each piece its own draw, placed with the 2D draws near it. */
+        int r;
+        d.hud_defer = 1;
+        s_hud_src++;
+        for (r = 0; r < nruns; r++) {
+            d.indices = b->indices + runs[r].first;
+            d.nindices = runs[r].count;
+            memcpy(d.hud_box, runs[r].box, sizeof d.hud_box);
+            x.count = runs[r].count;
+            s_vsh = &d;
+            vkb_draw_xf(sf, &x);
+        }
+        s_vsh = NULL;
+        return 1;
+    }
     s_vsh = &d;
     vkb_draw_xf(sf, &x);
     s_vsh = NULL;

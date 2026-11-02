@@ -118,6 +118,9 @@ void gr2_startup(void)
     set_default("RECOMP_RENDERER", "vk");
     set_default("RECOMP_AC97_READY", "1");
     set_default("RECOMP_MKB", "1");
+    /* The mouse reaches the stick's full throw at 4 counts a frame (the
+     * toolkit's 8 turned the camera barely at all at desk speeds). */
+    set_default("RECOMP_MKB_FULL", "4");
     set_default("RECOMP_USB", "1");
     set_default("RECOMP_VBLANK", "1");
     set_default("RECOMP_TRACE_BUDGET", "0");

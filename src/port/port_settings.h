@@ -15,7 +15,9 @@ extern "C" {
 #endif
 
 enum { PS_WINDOWED = 0, PS_BORDERLESS = 1, PS_FULLSCREEN = 2 };
-enum { PS_ASPECT_4_3 = 0, PS_ASPECT_16_9 = 1, PS_ASPECT_FILL = 2 };
+/* PS_ASPECT_NATIVE: native widescreen -- the game's camera sees more at the
+ * sides to fill the window's shape, the HUD kept unstretched. */
+enum { PS_ASPECT_4_3 = 0, PS_ASPECT_16_9 = 1, PS_ASPECT_FILL = 2, PS_ASPECT_NATIVE = 3 };
 enum { PS_AA_OFF = 0, PS_AA_SMAA = 1 };
 enum { PS_UPSCALE_BILINEAR = 0, PS_UPSCALE_FSR1 = 1 };
 
@@ -30,6 +32,7 @@ typedef struct {
     int   shader_cache;    /* 0/1: keep compiled shaders on disk */
     float render_scale;    /* internal resolution, times 640x480 (1..5) */
     int   aspect;          /* PS_ASPECT_*: how the 4:3 frame fills the window */
+    float hud_pos;         /* native widescreen: corner HUD from the 4:3 area (0) to the edges (1) */
     int   aa;              /* PS_AA_*: anti-aliasing of the frame */
     int   upscaler;        /* PS_UPSCALE_*: enlarging to the window */
     float sharpen;         /* RCAS at the end, 0 off .. 1 sharpest */

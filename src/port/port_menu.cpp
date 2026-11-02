@@ -21,6 +21,8 @@ extern "C" {
 #include "port_settings.h"
 #include "vk_glsl.h"
 #include "port_version.h"
+#include "port_controls.h"
+#include "mkb_input.h"
 extern void vkb_pipeline_cache_forget(void);
 extern void xbox_InputSetBlocked(int blocked);
 extern void xbox_InputKeysClear(void);
@@ -30,6 +32,8 @@ static PortMenuInit s_init;
 static bool s_ready;
 static bool s_open;
 static bool s_dirty;            /* applied, not yet written to gr2.ini */
+/* A binding waiting for its key ("Press a key"): the row's action and slot. */
+static int s_cap_action = -1, s_cap_slot;
 
 static void set_open(bool open);
 
@@ -95,6 +99,10 @@ extern "C" int pmenu_is_open(void)
 
 static void set_open(bool open)
 {
+    if (s_cap_action >= 0) {
+        mkb_capture_cancel();
+        s_cap_action = -1;
+    }
     s_open = open;
     if (!open && s_dirty) {
         port_settings_save();
@@ -110,6 +118,14 @@ extern "C" int pmenu_event(const SDL_Event *ev)
 {
     if (!s_ready)
         return 0;
+    /* Waiting for a key to bind: the press is the binding (taken from raw
+     * input), not a click or a keystroke for the menu -- Delete and Home
+     * cancel it instead of closing the menu. */
+    if (s_open && s_cap_action >= 0
+        && (ev->type == SDL_KEYDOWN || ev->type == SDL_KEYUP || ev->type == SDL_TEXTINPUT
+            || ev->type == SDL_MOUSEBUTTONDOWN || ev->type == SDL_MOUSEBUTTONUP
+            || ev->type == SDL_MOUSEWHEEL))
+        return 1;
     if (ev->type == SDL_KEYDOWN && !ev->key.repeat
         && (ev->key.keysym.sym == SDLK_DELETE || ev->key.keysym.sym == SDLK_HOME)) {
         set_open(!s_open);
@@ -174,7 +190,10 @@ static void panel(void)
 
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(460 * scale, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(560 * scale, 0), ImGuiCond_Always);
+    /* Never taller than the window: the controls table scrolls. */
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+                                        ImVec2(FLT_MAX, io.DisplaySize.y * 0.95f));
     ImGui::Begin("Ghost Recon 2 " PORT_VERSION " - Port Options", nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize
                  | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
@@ -230,12 +249,25 @@ static void panel(void)
         }
         {
             static const char *aspects[] = { "4:3 (original)", "16:9 (stretched)",
-                                             "Fill window (stretched)" };
+                                             "Fill window (stretched)",
+                                             "Native widescreen (fit window)" };
             if (ImGui::Combo("Aspect ratio", &s->aspect, aspects, IM_ARRAYSIZE(aspects)))
                 changed = true;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("The game draws 4:3; 16:9 stretches it sideways,\n"
-                                  "as xemu's widescreen view does.");
+                ImGui::SetTooltip("The game draws 4:3; 16:9 and Fill stretch it sideways,\n"
+                                  "as xemu's widescreen view does. Native widescreen shows\n"
+                                  "more of the world at the sides instead, for any screen\n"
+                                  "shape, with the HUD unstretched; menus and movies stay 4:3.");
+            if (s->aspect == PS_ASPECT_NATIVE) {
+                float hp = s->hud_pos * 100.0f;
+                if (ImGui::SliderFloat("HUD position", &hp, 0.0f, 100.0f, "%.0f%%")) {
+                    s->hud_pos = hp / 100.0f;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Where the corner HUD (radar, ammo, team) sits:\n"
+                                      "0%% where the 4:3 game had it, 100%% at the screen's edges.");
+            }
         }
         {
             static const char *aas[] = { "Off", "SMAA" };
@@ -329,6 +361,79 @@ static void panel(void)
                 port_settings_save();
                 port_settings_restart();
             }
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Controls (keyboard and mouse)")) {
+        float sens = (float)mkb_sensitivity();
+        if (ImGui::SliderFloat("Mouse sensitivity", &sens, 0.1f, 10.0f, "%.2f")) {
+            mkb_set_sensitivity(sens);
+            changed = true;
+        }
+        bool inv = mkb_invert_y() != 0;
+        if (ImGui::Checkbox("Invert mouse Y", &inv)) {
+            mkb_set_invert_y(inv);
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to defaults")) {
+            if (s_cap_action >= 0) { mkb_capture_cancel(); s_cap_action = -1; }
+            port_controls_defaults();
+            changed = true;
+        }
+        ImGui::TextDisabled("Click a key to change it, right-click to clear it.\n"
+                            "The mouse always aims. F9 frees the mouse.");
+
+        /* A press arrived for the binding being changed. */
+        if (s_cap_action >= 0) {
+            int r = mkb_capture_result();
+            if (r >= 0) {
+                if (r > 0)
+                    mkb_bind(s_cap_action, s_cap_slot, r);
+                s_cap_action = -1;
+                changed = true;
+            }
+        }
+
+        if (ImGui::BeginTable("binds", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Alternative", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < port_control_row_count; i++) {
+                const PortControlRow *row = &port_control_rows[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(row->label);
+                for (int slot = 0; slot < MKB_SLOTS; slot++) {
+                    char name[64], id[96];
+                    ImGui::TableNextColumn();
+                    bool waiting = s_cap_action == row->action && s_cap_slot == slot;
+                    if (waiting)
+                        snprintf(name, sizeof name, "Press a key...");
+                    else {
+                        mkb_input_name(mkb_binding(row->action, slot), name, sizeof name);
+                        if (!name[0])
+                            snprintf(name, sizeof name, "-");
+                    }
+                    snprintf(id, sizeof id, "%s##b%d_%d", name, row->action, slot);
+                    if (waiting)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.45f, 0.10f, 1.0f));
+                    if (ImGui::Button(id, ImVec2(-1.0f, 0.0f)) && s_cap_action < 0) {
+                        s_cap_action = row->action;
+                        s_cap_slot = slot;
+                        mkb_capture_begin();
+                    }
+                    if (waiting)
+                        ImGui::PopStyleColor();
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && s_cap_action < 0) {
+                        mkb_bind(row->action, slot, 0);
+                        changed = true;
+                    }
+                }
+            }
+            ImGui::EndTable();
         }
     }
 

@@ -1,3 +1,17 @@
 [
-  {"start": "0x0042F970", "name": "D3D_BlockOnTime", "file": "src/gr2_d3d.c"}
+  {
+    "start": "0x0042F970",
+    "name": "D3D_BlockOnTime",
+    "file": "src/gr2_d3d.c"
+  },
+  {
+    "start": "0x0044609E",
+    "name": "D3DXMatrixPerspectiveOffCenterLH",
+    "file": "src/gr2_widescreen.c"
+  },
+  {
+    "start": "0x001EE3E0",
+    "name": "WrapAngle_MouseLook",
+    "file": "src/gr2_mouse.c"
+  }
 ]

@@ -562,6 +562,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
 
+    /* The camera's aspect ratio, before the first camera is made. */
+    {
+        extern void gr2_widescreen_boot(void);
+        gr2_widescreen_boot();
+        {
+            extern void gr2_mouse_boot(void);
+            gr2_mouse_boot();
+        }
+    }
+
     /* Bring up the emulated APU.
      *
      * Gated on the same variable that unmaps its registers, because the two

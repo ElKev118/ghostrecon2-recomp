@@ -30,6 +30,7 @@
  *                              limiter load and the voices ([AUDIO-CAP])
  */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -581,11 +582,44 @@ static int present(int upload)
          * xemu shows it; GR2 has no widescreen mode of its own), or to the
          * whole window. */
         uint32_t ax = 4, ay = 3, dw, dh;
+        /* RECOMP_DISPLAY_ASPECT=<w/h>: show the frame at that shape inside
+         * the window, with bars -- a 21:9 or 32:9 screen seen on a 16:9
+         * monitor (the widescreen trials). Overrides the aspect setting. */
+        static float display_aspect = -1.0f;
+        if (display_aspect < 0.0f) {
+            const char *e = getenv("RECOMP_DISPLAY_ASPECT");
+            display_aspect = e ? (float)atof(e) : 0.0f;
+        }
+        extern int vkb_presented_is_2d(void);
         if (port_settings()->aspect == PS_ASPECT_16_9) { ax = 16; ay = 9; }
+        if (display_aspect > 0.5f) {
+            ax = (uint32_t)(display_aspect * 10000.0f); ay = 10000;
+        } else if (!getenv("RECOMP_GR2_ASPECT")) {
+            /* Native widescreen: the camera widened to the window's shape
+             * (one narrower than 4:3 stays 4:3), set here as the window
+             * changes; the trial launchers set it themselves instead. */
+            extern void gr2_set_widescreen(float aspect, float hud_pos);
+            static float said_aspect = -1.0f, said_hud = -1.0f;
+            float want = 4.0f / 3.0f, hud = port_settings()->hud_pos;
+            if (port_settings()->aspect == PS_ASPECT_NATIVE && wh) {
+                want = (float)ww / (float)wh;
+                if (want < 4.0f / 3.0f) want = 4.0f / 3.0f;
+                ax = (uint32_t)(want * 10000.0f); ay = 10000;
+            }
+            if (fabsf(want - said_aspect) > 0.002f * want || hud != said_hud) {
+                said_aspect = want;
+                said_hud = hud;
+                gr2_set_widescreen(want, hud);
+            }
+        }
+        /* Native widescreen: a frame with no 3D (menus, movies, loading) is
+         * the title's 4:3 picture, with bars. */
+        if (vkb_presented_is_2d()) { ax = 4; ay = 3; }
         dw = ww;
-        dh = ww * ay / ax;
-        if (dh > wh) { dh = wh; dw = wh * ax / ay; }
-        if (port_settings()->aspect == PS_ASPECT_FILL) { dw = ww; dh = wh; }
+        dh = (uint32_t)((uint64_t)ww * ay / ax);
+        if (dh > wh) { dh = wh; dw = (uint32_t)((uint64_t)wh * ax / ay); }
+        if (port_settings()->aspect == PS_ASPECT_FILL && display_aspect <= 0.5f
+            && !vkb_presented_is_2d()) { dw = ww; dh = wh; }
         memset(&b, 0, sizeof(b));
         b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         b.srcSubresource.layerCount = 1;
@@ -783,9 +817,19 @@ static int window_thread(void *unused)
         fprintf(stderr, "[VKW] SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    V.win = SDL_CreateWindow("Ghost Recon 2", SDL_WINDOWPOS_CENTERED,
-                             SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
-                             SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    {
+        /* RECOMP_WINDOW_SIZE=WxH: any shape, e.g. 2560x720 to see a 32:9
+         * screen on an ordinary monitor. */
+        int ww = 640 * scale, wh = 480 * scale;
+        const char *sz = getenv("RECOMP_WINDOW_SIZE");
+        if (sz && sscanf(sz, "%dx%d", &ww, &wh) != 2) {
+            ww = 640 * scale;
+            wh = 480 * scale;
+        }
+        V.win = SDL_CreateWindow("Ghost Recon 2", SDL_WINDOWPOS_CENTERED,
+                                 SDL_WINDOWPOS_CENTERED, ww, wh,
+                                 SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    }
     if (!V.win) {
         fprintf(stderr, "[VKW] SDL_CreateWindow: %s\n", SDL_GetError());
         return 1;
@@ -902,8 +946,12 @@ static int window_thread(void *unused)
 
         {
             /* The pointer hides over the window after 2 s without moving,
-             * and comes back with the mouse or the options menu. */
-            int show = pmenu_is_open() || SDL_GetTicks() - last_mouse < 2000;
+             * and comes back with the mouse or the options menu -- but not
+             * while the mouse aims (keyboard and mouse captured): the
+             * crosshair is the pointer then. */
+            extern int mkb_capturing(void);
+            int show = pmenu_is_open()
+                       || (!mkb_capturing() && SDL_GetTicks() - last_mouse < 2000);
             if (show != cursor_shown) {
                 SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
                 cursor_shown = show;

@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "port_settings.h"
+#include "port_controls.h"
 
 /* Live setters: the toolkit's mixer and the title's frame limiter. */
 extern void  xbox_AudioSetVolume(int pct);
@@ -70,7 +71,7 @@ void port_settings_startup(void)
               && GetFileAttributesA(s_path) != INVALID_FILE_ATTRIBUTES;
 
     /* Defaults: the launcher's variables, as before the menu existed. */
-    s_cur.window_mode = PS_WINDOWED;
+    s_cur.window_mode = env_int("RECOMP_WINDOW_MODE", PS_WINDOWED);
     s_cur.vsync = !(getenv("RECOMP_PRESENT_VSYNC")
                     && getenv("RECOMP_PRESENT_VSYNC")[0] == '0');
     s_cur.frame_ms = gr2_get_frame_ms();
@@ -83,11 +84,14 @@ void port_settings_startup(void)
     s_cur.render_scale = getenv("RECOMP_RENDER_SCALE")
                        ? (float)atof(getenv("RECOMP_RENDER_SCALE")) : 1.0f;
     s_cur.aspect = env_int("RECOMP_ASPECT", PS_ASPECT_4_3);
+    s_cur.hud_pos = getenv("RECOMP_HUD_POS") ? (float)atof(getenv("RECOMP_HUD_POS")) : 1.0f;
     s_cur.scale_filter = env_int("RECOMP_SCALE_FILTER", 1);
     s_cur.aa = env_int("RECOMP_AA", PS_AA_OFF);
     s_cur.upscaler = env_int("RECOMP_UPSCALER", PS_UPSCALE_FSR1);
     s_cur.debug_keys = env_int("RECOMP_DEBUG_KEYS", 0);
     s_cur.sharpen = getenv("RECOMP_SHARPEN") ? (float)atof(getenv("RECOMP_SHARPEN")) : 0.0f;
+    /* Keyboard and mouse: [Controls], else this game's layout. */
+    port_controls_load(s_path, use_ini);
 
     if (use_ini) {
         char buf[16];
@@ -102,6 +106,7 @@ void port_settings_startup(void)
         s_cur.shader_cache = ini_int("Display", "ShaderCache", s_cur.shader_cache);
         s_cur.render_scale = ini_float("Display", "RenderScale", s_cur.render_scale);
         s_cur.aspect = ini_int("Display", "Aspect", s_cur.aspect);
+        s_cur.hud_pos = ini_float("Display", "HudPosition", s_cur.hud_pos);
         s_cur.scale_filter = ini_int("Display", "ScaleFilter", s_cur.scale_filter);
         s_cur.aa = ini_int("Display", "AntiAliasing", s_cur.aa);
         s_cur.upscaler = ini_int("Display", "Upscaler", s_cur.upscaler);
@@ -149,12 +154,19 @@ int port_settings_save(void)
     char b[32];
     int ok = 1;
 
+    /* A run that ignores gr2.ini (tests, the widescreen trial launchers)
+     * must not overwrite it with its own values either. */
+    if (getenv("RECOMP_NO_INI")) {
+        fprintf(stderr, "[PORT] RECOMP_NO_INI: settings not saved\n");
+        return 1;
+    }
     snprintf(b, sizeof b, "%d", s_cur.window_mode); ok &= put("Display", "WindowMode", b);
     snprintf(b, sizeof b, "%d", s_cur.vsync);       ok &= put("Display", "VSync", b);
     snprintf(b, sizeof b, "%d", s_cur.shader_cache); ok &= put("Display", "ShaderCache", b);
     snprintf(b, sizeof b, "%.3f", s_cur.frame_ms);  ok &= put("Display", "FrameLimitMs", b);
     snprintf(b, sizeof b, "%.2f", s_cur.render_scale); ok &= put("Display", "RenderScale", b);
     snprintf(b, sizeof b, "%d", s_cur.aspect);      ok &= put("Display", "Aspect", b);
+    snprintf(b, sizeof b, "%.2f", s_cur.hud_pos);   ok &= put("Display", "HudPosition", b);
     snprintf(b, sizeof b, "%d", s_cur.scale_filter); ok &= put("Display", "ScaleFilter", b);
     snprintf(b, sizeof b, "%d", s_cur.aa);          ok &= put("Display", "AntiAliasing", b);
     snprintf(b, sizeof b, "%d", s_cur.upscaler);    ok &= put("Display", "Upscaler", b);
@@ -163,6 +175,7 @@ int port_settings_save(void)
     snprintf(b, sizeof b, "%.3f", s_cur.reverb);    ok &= put("Audio", "Reverb", b);
     snprintf(b, sizeof b, "%.3f", s_cur.ambience);  ok &= put("Audio", "Ambience", b);
     snprintf(b, sizeof b, "%d", s_cur.language);    ok &= put("Game", "Language", b);
+    ok &= port_controls_save(s_path);
     fprintf(stderr, "[PORT] settings %s %s\n", ok ? "saved to" : "NOT saved to", s_path);
     return ok;
 }

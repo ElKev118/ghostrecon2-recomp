@@ -12,6 +12,13 @@ cmake_minimum_required(VERSION 3.20)
 
 project(ghostrecon2 C CXX)
 
+# The C/C++ runtime is linked into the exe (/MT), for every target -- the
+# toolkit, SDL2, glslang and the rest -- so the release needs no Visual C++
+# Redistributable (and runs in a bare Wine/Proton prefix). Set before any
+# target exists; SDL2 declares an old policy level and needs its own switch.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(SDL_FORCE_STATIC_VCRT ON CACHE BOOL "" FORCE)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -54,6 +61,8 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/gr2_d3d.c
     src/gr2_debug.c
+    src/gr2_widescreen.c
+    src/gr2_mouse.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -67,6 +76,7 @@ set(GAME_SOURCES
 
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
+    res/ghostrecon2.rc    # icon and version information
     ${RECOMP_GEN_SOURCES}
 )
 
@@ -208,7 +218,7 @@ set(PORT_MENU_SOURCES
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
 target_sources(${PROJECT_NAME} PRIVATE ${PORT_MENU_SOURCES} src/port/port_settings.c
-    src/port/gr2_paths.c)
+    src/port/port_controls.c src/port/gr2_paths.c)
 # SMAA (iryoku/smaa, MIT): the window's anti-aliasing pass (vk_post.c). The
 # shader source goes in as a byte array, compiled at runtime like the rest;
 # its area and search textures are C headers already.
