@@ -41,6 +41,8 @@ const PortControlRow port_control_rows[] = {
     { MKB_LOOK_DOWN,  "Look down (keys)" },
     { MKB_LOOK_LEFT,  "Look left (keys)" },
     { MKB_LOOK_RIGHT, "Look right (keys)" },
+    //unwritt3n patch: added MKB_RUN
+    { MKB_RUN,        "Run (hold Shift)" },
 };
 const int port_control_row_count = sizeof port_control_rows / sizeof port_control_rows[0];
 
@@ -67,6 +69,8 @@ void port_controls_defaults(void)
         { MKB_DPAD_RIGHT, 'E', VK_RIGHT },
         { MKB_START,      VK_ESCAPE, 0 },
         { MKB_BACK,       VK_TAB, 0 },
+        //unwritt3n patch: added MKB_RUN
+        { MKB_RUN,        VK_LSHIFT, 0 },
     };
     int a, s, i;
 
